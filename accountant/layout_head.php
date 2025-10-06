@@ -313,9 +313,9 @@ body.sidebar-collapsed .content{margin-left:0}
             confirmButton: 'swal-theme-confirm',
             cancelButton: 'swal-theme-cancel'
           }
-        }).then((r)=>{ if(r.isConfirmed) location.href = logout.php; });
+        }).then((r)=>{ if(r.isConfirmed) location.href = LOGOUT_URL; });
       } else {
-        if (confirm('Are you sure you want to logout?')) location.href = logout.php;
+        if (confirm('Are you sure you want to logout?')) location.href = LOGOUT_URL;
       }
     };
   }
