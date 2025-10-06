@@ -3,9 +3,9 @@
 // PoultryMetrics – Admin > Customer Approvals (map in View modal; top summary removed)
 
 $PAGE_TITLE = 'Customer Approvals';
-require_once __DIR__ . '/inc/common.php'; // session, config, admin auth; may or may not define helper names
+require_once __DIR__ . '/inc/common.php'; // session, config, admin auth
 
-/* ---------- Helper shims (define if your common.php doesn't) ---------- */
+/* ---------- Helper shims ---------- */
 if (!function_exists('h')) {
   function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 }
@@ -40,7 +40,7 @@ if (!function_exists('scalar')) {
   }
 }
 
-/* ---------- CSRF (guarded to avoid redeclare) ---------- */
+/* ---------- CSRF ---------- */
 if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32));
 if (!function_exists('csrf_ok')) {
   function csrf_ok($t){ return isset($_SESSION['csrf']) && hash_equals($_SESSION['csrf'], (string)($t ?? '')); }
@@ -50,29 +50,20 @@ if (!function_exists('csrf_ok')) {
 $U_TBL = 'users';
 if (!tableExists($conn,$U_TBL)) { http_response_code(500); die('Users table not found.'); }
 
-$U_ID       = colExists($conn,$U_TBL,'id')        ? 'id'        : (colExists($conn,$U_TBL,'user_id') ? 'user_id' : 'id');
-$U_USER     = colExists($conn,$U_TBL,'username')  ? 'username'  : (colExists($conn,$U_TBL,'user_name') ? 'user_name' : null);
-$U_MAIL     = colExists($conn,$U_TBL,'email')     ? 'email'     : (colExists($conn,$U_TBL,'email_address') ? 'email_address' : null);
-$U_ROLE     = colExists($conn,$U_TBL,'role')      ? 'role'      : (colExists($conn,$U_TBL,'user_role') ? 'user_role' : null);
-$U_CREATED  = colExists($conn,$U_TBL,'created_at')? 'created_at': null;
-$U_STATUS   = colExists($conn,$U_TBL,'status')    ? 'status'    : (colExists($conn,$U_TBL,'account_status') ? 'account_status' : null);
-$U_ACTIVE   = colExists($conn,$U_TBL,'is_active') ? 'is_active' : (colExists($conn,$U_TBL,'active') ? 'active' : (colExists($conn,$U_TBL,'enabled') ? 'enabled' : null));
-$U_APPROVED = colExists($conn,$U_TBL,'is_approved') ? 'is_approved'
-            : (colExists($conn,$U_TBL,'approved') ? 'approved'
-            : (colExists($conn,$U_TBL,'verified') ? 'verified'
-            : (colExists($conn,$U_TBL,'is_verified') ? 'is_verified' : null)));
-$U_PHONE    = colExists($conn,$U_TBL,'phone') ? 'phone'
-            : (colExists($conn,$U_TBL,'phone_number') ? 'phone_number'
-            : (colExists($conn,$U_TBL,'mobile') ? 'mobile' : null));
-$U_FIRST    = colExists($conn,$U_TBL,'first_name') ? 'first_name'
-            : (colExists($conn,$U_TBL,'given_name') ? 'given_name'
-            : (colExists($conn,$U_TBL,'fname') ? 'fname' : null));
-$U_MIDDLE   = colExists($conn,$U_TBL,'middle_name') ? 'middle_name'
-            : (colExists($conn,$U_TBL,'mname') ? 'mname'
-            : (colExists($conn,$U_TBL,'middlename') ? 'middlename' : null));
-$U_LAST     = colExists($conn,$U_TBL,'last_name') ? 'last_name'
-            : (colExists($conn,$U_TBL,'family_name') ? 'family_name'
-            : (colExists($conn,$U_TBL,'lname') ? 'lname' : null));
+/* try several primary key names (handles UUID or custom keys) */
+$U_ID = firstExistingCol($conn,$U_TBL, ['id','user_id','uid','users_id','uuid']) ?? 'id';
+
+$U_USER     = firstExistingCol($conn,$U_TBL, ['username','user_name']);
+$U_MAIL     = firstExistingCol($conn,$U_TBL, ['email','email_address']);
+$U_ROLE     = firstExistingCol($conn,$U_TBL, ['role','user_role']);
+$U_CREATED  = firstExistingCol($conn,$U_TBL, ['created_at','created','registered_at']);
+$U_STATUS   = firstExistingCol($conn,$U_TBL, ['status','account_status']);
+$U_ACTIVE   = firstExistingCol($conn,$U_TBL, ['is_active','active','enabled']);
+$U_APPROVED = firstExistingCol($conn,$U_TBL, ['is_approved','approved','verified','is_verified']);
+$U_PHONE    = firstExistingCol($conn,$U_TBL, ['phone','phone_number','mobile']);
+$U_FIRST    = firstExistingCol($conn,$U_TBL, ['first_name','given_name','fname']);
+$U_MIDDLE   = firstExistingCol($conn,$U_TBL, ['middle_name','mname','middlename']);
+$U_LAST     = firstExistingCol($conn,$U_TBL, ['last_name','family_name','lname']);
 
 /* ---------- Related tables ---------- */
 $HAS_PROFILES  = tableExists($conn,'customer_profiles');
@@ -94,14 +85,11 @@ $APR_TIME_COL = null; // submitted_at or created_at
 $APR_PK = null;
 
 if ($APR_TBL) {
-  foreach (['user_id','customer_id','uid','users_id'] as $c)  if (colExists($conn,$APR_TBL,$c)) { $APR_UID = $c; break; }
-  foreach (['status','state','approval_status'] as $c)        if (colExists($conn,$APR_TBL,$c)) { $APR_STATUS = $c; break; }
-  foreach (['note','remarks','comment'] as $c)                if (colExists($conn,$APR_TBL,$c)) { $APR_NOTE = $c; break; }
-
-  $APR_TIME_COL = colExists($conn,$APR_TBL,'submitted_at') ? 'submitted_at'
-               : (colExists($conn,$APR_TBL,'created_at')    ? 'created_at'    : null);
-
-  $APR_PK = firstExistingCol($conn,$APR_TBL,['id','approval_id','log_id','entry_id']);
+  $APR_UID      = firstExistingCol($conn,$APR_TBL,['user_id','customer_id','uid','users_id']);
+  $APR_STATUS   = firstExistingCol($conn,$APR_TBL,['status','state','approval_status']);
+  $APR_NOTE     = firstExistingCol($conn,$APR_TBL,['note','remarks','comment']);
+  $APR_TIME_COL = firstExistingCol($conn,$APR_TBL,['submitted_at','created_at']);
+  $APR_PK       = firstExistingCol($conn,$APR_TBL,['id','approval_id','log_id','entry_id']);
 }
 
 /* ---------- Helpers ---------- */
@@ -124,13 +112,13 @@ function normalize_status_row(array $r, ?string $U_STATUS, $U_ACTIVE, $U_APPROVE
   return 'pending';
 }
 
-/* ---------- JSON view endpoint for modal (returns full data) ---------- */
+/* ---------- JSON view endpoint for modal ---------- */
 if (isset($_GET['view']) && (int)($_GET['view'])===1) {
   header('Content-Type: application/json; charset=utf-8');
   $uid = trim((string)($_GET['user_id'] ?? ''));
-  if ($uid === '') { echo json_encode(['ok'=>false,'error'=>'Invalid user']); exit; }
+  if ($uid === '') { echo json_encode(['ok'=>false,'error'=>'Invalid user id']); exit; }
 
-  // Latest approval time
+  /* Latest approval time */
   if ($APR_TBL && $APR_UID && $APR_TIME_COL) {
     $latestTimeExpr = "(SELECT MAX(a.`$APR_TIME_COL`) FROM `$APR_TBL` a WHERE a.`$APR_UID`=("
                     . (strtolower($APR_UID)==='customer_id'
@@ -141,7 +129,7 @@ if (isset($_GET['view']) && (int)($_GET['view'])===1) {
     $latestTimeExpr = $U_CREATED ? "u.`$U_CREATED`" : "NULL";
   }
 
-  // Latest approval status
+  /* Latest approval status */
   $latestStatusOrder = $APR_TIME_COL ? "a2.`$APR_TIME_COL` DESC" : ($APR_PK ? "a2.`$APR_PK` DESC" : "1");
   if ($APR_TBL && $APR_UID && $APR_STATUS) {
     $latestStatusExpr = "(SELECT a2.`$APR_STATUS` FROM `$APR_TBL` a2 WHERE a2.`$APR_UID`=("
@@ -170,19 +158,21 @@ if (isset($_GET['view']) && (int)($_GET['view'])===1) {
   if ($U_MIDDLE)       $selCols[] = "u.`$U_MIDDLE` AS u_middle";
   if ($U_LAST)         $selCols[] = "u.`$U_LAST` AS u_last";
 
-  $sql = "SELECT ".implode(',', $selCols)." FROM `$U_TBL` u WHERE u.`$U_ID`=? LIMIT 1";
+  /* IMPORTANT: cast PK to CHAR to match both INT and UUID values safely */
+  $sql = "SELECT ".implode(',', $selCols)." FROM `$U_TBL` u WHERE CAST(u.`$U_ID` AS CHAR)=? LIMIT 1";
   $st=$conn->prepare($sql);
-  $st->bind_param('s',$uid); // string bind (works for int/uuid)
+  if(!$st){ echo json_encode(['ok'=>false,'error'=>'Prepare failed']); exit; }
+  $st->bind_param('s',$uid);
   $st->execute();
   $row = $st->get_result()->fetch_assoc();
   $st->close();
 
-  if (!$row) { echo json_encode(['ok'=>false,'error'=>'User not found']); exit; }
+  if (!$row) { echo json_encode(['ok'=>false,'error'=>'User not found for ID: '.$uid]); exit; }
 
   $status_norm = normalize_status_row($row, $U_STATUS, $U_ACTIVE, $U_APPROVED);
   $requested   = !empty($row['requested_at']) ? $row['requested_at'] : (!empty($row['created_at']) ? $row['created_at'] : '');
 
-  // Profile details + raw lat/lng for the map
+  /* Profile details + raw lat/lng for the map */
   $profile = [];
   $lat = null; $lng = null;
   if ($HAS_PROFILES){
@@ -194,14 +184,14 @@ if (isset($_GET['view']) && (int)($_GET['view'])===1) {
                        FROM customer_profiles
                        WHERE user_id=? ORDER BY id DESC LIMIT 1");
     if ($p){
-      $p->bind_param('s',$uid); // string bind (user_id may be string)
+      $p->bind_param('s',$uid); // string bind (works whether column is int or char)
       $p->execute();
       $x=$p->get_result();
       if ($x && $x->num_rows){
         $pr=$x->fetch_assoc();
 
         $add = function($label,$value) use (&$profile){
-          $v = trim((string)($value ?? ''));
+          $v = trim((string)$value);
           if($v!=='') $profile[]=['label'=>$label,'value'=>$v];
         };
 
@@ -272,8 +262,8 @@ function set_user_status(mysqli $conn, string $uid, string $target,
   if ($U_ACTIVE){   $parts[]="`$U_ACTIVE`=?";   $types.='i'; $vals[] = ($target==='active'?1:0); }
   if ($U_APPROVED){ $parts[]="`$U_APPROVED`=?"; $types.='i'; $vals[] = ($target==='active'?1:0); }
   if (!$parts) return true;
-  $sql="UPDATE `$U_TBL` SET ".implode(',', $parts)." WHERE `$U_ID`=?";
-  $types.='s'; $vals[]=$uid; // string bind for user id
+  $sql="UPDATE `$U_TBL` SET ".implode(',', $parts)." WHERE CAST(`$U_ID` AS CHAR)=?";
+  $types.='s'; $vals[]=$uid;
   $st=$conn->prepare($sql); if(!$st) return false;
   $st->bind_param($types, ...$vals);
   $ok=$st->execute(); $st->close();
@@ -286,9 +276,9 @@ function map_approval_fk_for_user(mysqli $conn, string $uid,
   if (in_array($u, ['user_id','uid','users_id'], true)) return $uid;
   if ($u === 'customer_id') {
     if ($C_TBL && $C_ID && $C_UID) {
-      $st = $conn->prepare("SELECT `$C_ID` FROM `$C_TBL` WHERE `$C_UID`=? LIMIT 1");
+      $st = $conn->prepare("SELECT `$C_ID` FROM `$C_TBL` WHERE CAST(`$C_UID` AS CHAR)=? LIMIT 1");
       if($st){
-        $st->bind_param('s',$uid); // users.$U_ID may be string
+        $st->bind_param('s',$uid);
         $st->execute(); $res=$st->get_result();
         $cid = ($res && $res->num_rows) ? (string)$res->fetch_row()[0] : null;
         $st->close(); return $cid;
@@ -343,7 +333,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       $val = map_approval_fk_for_user($conn,$uid,$APR_UID,$C_TBL,$C_ID,$C_UID) ?? $uid;
       $d=$conn->prepare("DELETE FROM `$APR_TBL` WHERE `$APR_UID`=?"); if($d){ $d->bind_param('s',$val); @$d->execute(); $d->close(); }
     }
-    $d=$conn->prepare("DELETE FROM `$U_TBL` WHERE `$U_ID`=?");
+    $d=$conn->prepare("DELETE FROM `$U_TBL` WHERE CAST(`$U_ID` AS CHAR)=?");
     $ok=$d && $d->bind_param('s',$uid) && $d->execute(); if($d) $d->close();
     $_SESSION['flash']=['type'=>$ok?'success':'error','msg'=>$ok?'User deleted.':'Delete failed (FK?).'];
   }
@@ -645,7 +635,7 @@ $PAGE_FOOT_SCRIPTS = "<script>
   // Modal: fetch details + render profile + map
   document.getElementById('viewModal')?.addEventListener('show.bs.modal', async (ev)=>{
     const trigger = ev.relatedTarget;
-    const btn = trigger?.closest('button[data-bs-target=\"#viewModal\"]') || trigger;
+    const btn = trigger?.closest('button[data-bs-target=\\\"#viewModal\\\"]') || trigger;
     const uid = btn?.getAttribute('data-id');
 
     const profWrap = document.getElementById('vm_profile');
@@ -661,7 +651,10 @@ $PAGE_FOOT_SCRIPTS = "<script>
 
     try{
       const r = await fetch('customer_approvals.php?view=1&user_id='+encodeURIComponent(uid), {headers:{'Accept':'application/json'}});
-      const data = await r.json();
+      const txt = await r.text();
+      let data = {};
+      try { data = JSON.parse(txt); } catch(e){ throw new Error('Bad JSON: '+txt.slice(0,200)); }
+
       if(!data.ok){ throw new Error(data.error||'Failed'); }
 
       // Profile labeled items
@@ -693,24 +686,21 @@ $PAGE_FOOT_SCRIPTS = "<script>
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
         const m = L.marker([lat, lng], { draggable:false }).addTo(map);
         m.bindPopup('Store location').openPopup();
-        // expose map link if not already set
         if (mapLink.href==='#') {
           mapLink.href = 'https://www.openstreetmap.org/?mlat='+lat+'&mlon='+lng+'#map=17/'+lat+'/'+lng;
           mapLink.style.display = 'inline-block';
         }
-        // Fix sizing after modal animation
         setTimeout(()=>{ map.invalidateSize(); }, 300);
       } else {
         mapEl.innerHTML = '<div class=\"text-muted small p-2\">No registered map location.</div>';
       }
     }catch(e){
-      profWrap.innerHTML = '<div class=\"text-danger small\">Unable to load details.</div>';
+      profWrap.innerHTML = '<div class=\"text-danger small\">Unable to load details: '+String(e).replace(/</g,'&lt;')+'</div>';
       mapEl.innerHTML = '<div class=\"text-danger small p-2\">Unable to load map.</div>';
     }
   });
 </script>";
 
-/* (Optional) small CSS kept in case you later re-add long fields */
 $PAGE_FOOT_SCRIPTS .= '<style>
   #viewModal .text-break { word-break: break-word; overflow-wrap: anywhere; }
 </style>';
