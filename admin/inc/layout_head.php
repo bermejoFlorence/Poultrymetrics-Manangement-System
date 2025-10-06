@@ -79,7 +79,7 @@ if (!defined('BASE_URI')) {
 /* ---------- ADMIN-ONLY AUTH GUARD (no output before this) ---------- */
 $role = strtolower((string)($_SESSION['role'] ?? ''));
 if (empty($_SESSION['user_id']) || $role !== 'admin') {
-  $loginUrl = BASE_URI . (is_file(dirname(__DIR__) . '/login.php') ? '/admin/login.php' : '/login.php');
+  $loginUrl = BASE_URI . (is_file(dirname(__DIR__) . 'login.php') ? 'login.php' : 'login.php');
   header('Location: ' . $loginUrl);
   exit;
 }
