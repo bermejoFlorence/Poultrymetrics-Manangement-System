@@ -127,8 +127,8 @@ function normalize_status_row(array $r, ?string $U_STATUS, $U_ACTIVE, $U_APPROVE
 /* ---------- JSON view endpoint for modal (returns full data) ---------- */
 if (isset($_GET['view']) && (int)($_GET['view'])===1) {
   header('Content-Type: application/json; charset=utf-8');
-  $uid = (int)($_GET['user_id'] ?? 0);
-  if ($uid <= 0) { echo json_encode(['ok'=>false,'error'=>'Invalid user']); exit; }
+  $uid = trim((string)($_GET['user_id'] ?? ''));
+  if ($uid === '') { echo json_encode(['ok'=>false,'error'=>'Invalid user']); exit; }
 
   // Latest approval time
   if ($APR_TBL && $APR_UID && $APR_TIME_COL) {
@@ -172,7 +172,7 @@ if (isset($_GET['view']) && (int)($_GET['view'])===1) {
 
   $sql = "SELECT ".implode(',', $selCols)." FROM `$U_TBL` u WHERE u.`$U_ID`=? LIMIT 1";
   $st=$conn->prepare($sql);
-  $st->bind_param('i',$uid);
+  $st->bind_param('s',$uid); // string bind (works for int/uuid)
   $st->execute();
   $row = $st->get_result()->fetch_assoc();
   $st->close();
@@ -194,7 +194,7 @@ if (isset($_GET['view']) && (int)($_GET['view'])===1) {
                        FROM customer_profiles
                        WHERE user_id=? ORDER BY id DESC LIMIT 1");
     if ($p){
-      $p->bind_param('i',$uid);
+      $p->bind_param('s',$uid); // string bind (user_id may be string)
       $p->execute();
       $x=$p->get_result();
       if ($x && $x->num_rows){
@@ -265,7 +265,7 @@ if (isset($_GET['view']) && (int)($_GET['view'])===1) {
 }
 
 /* ---------- Status helpers used by actions ---------- */
-function set_user_status(mysqli $conn, int $uid, string $target,
+function set_user_status(mysqli $conn, string $uid, string $target,
                          string $U_TBL, ?string $U_STATUS, ?string $U_ACTIVE, ?string $U_APPROVED, string $U_ID): bool {
   $parts=[]; $types=''; $vals=[];
   if ($U_STATUS){   $parts[]="`$U_STATUS`=?";   $types.='s'; $vals[] = ($target==='active'?'active':($target==='disabled'?'disabled':'pending')); }
@@ -273,34 +273,46 @@ function set_user_status(mysqli $conn, int $uid, string $target,
   if ($U_APPROVED){ $parts[]="`$U_APPROVED`=?"; $types.='i'; $vals[] = ($target==='active'?1:0); }
   if (!$parts) return true;
   $sql="UPDATE `$U_TBL` SET ".implode(',', $parts)." WHERE `$U_ID`=?";
-  $types.='i'; $vals[]=$uid;
+  $types.='s'; $vals[]=$uid; // string bind for user id
   $st=$conn->prepare($sql); if(!$st) return false;
   $st->bind_param($types, ...$vals);
   $ok=$st->execute(); $st->close();
   return $ok;
 }
-function map_approval_fk_for_user(mysqli $conn, int $uid,
-                                  ?string $APR_UID, ?string $C_TBL, ?string $C_ID, ?string $C_UID): ?int {
+function map_approval_fk_for_user(mysqli $conn, string $uid,
+                                  ?string $APR_UID, ?string $C_TBL, ?string $C_ID, ?string $C_UID): ?string {
   if (!$APR_UID) return null;
   $u = strtolower($APR_UID);
   if (in_array($u, ['user_id','uid','users_id'], true)) return $uid;
   if ($u === 'customer_id') {
     if ($C_TBL && $C_ID && $C_UID) {
       $st = $conn->prepare("SELECT `$C_ID` FROM `$C_TBL` WHERE `$C_UID`=? LIMIT 1");
-      if($st){ $st->bind_param('i',$uid); $st->execute(); $res=$st->get_result(); $cid = ($res && $res->num_rows) ? (int)$res->fetch_row()[0] : null; $st->close(); return $cid; }
+      if($st){
+        $st->bind_param('s',$uid); // users.$U_ID may be string
+        $st->execute(); $res=$st->get_result();
+        $cid = ($res && $res->num_rows) ? (string)$res->fetch_row()[0] : null;
+        $st->close(); return $cid;
+      }
     }
     return null;
   }
   return null;
 }
-function log_approval(mysqli $conn, int $uid, string $newStatus, string $note='',
+function log_approval(mysqli $conn, string $uid, string $newStatus, string $note='',
                       ?string $APR_TBL=null, ?string $APR_UID=null, ?string $APR_STATUS=null, ?string $APR_NOTE=null,
                       ?string $C_TBL=null, ?string $C_ID=null, ?string $C_UID=null): bool {
   if (!$APR_TBL || !$APR_UID || !$APR_STATUS) return true; // nothing to log, but OK
   $fkVal = map_approval_fk_for_user($conn,$uid,$APR_UID,$C_TBL,$C_ID,$C_UID);
   if ($fkVal === null) return true; // avoid FK errors
-  if ($APR_NOTE) { $st=$conn->prepare("INSERT INTO `$APR_TBL` (`$APR_UID`, `$APR_STATUS`, `$APR_NOTE`) VALUES (?,?,?)"); if(!$st) return false; $st->bind_param('iss',$fkVal,$newStatus,$note); }
-  else           { $st=$conn->prepare("INSERT INTO `$APR_TBL` (`$APR_UID`, `$APR_STATUS`) VALUES (?,?)");             if(!$st) return false; $st->bind_param('is',$fkVal,$newStatus); }
+  if ($APR_NOTE) {
+    $st=$conn->prepare("INSERT INTO `$APR_TBL` (`$APR_UID`, `$APR_STATUS`, `$APR_NOTE`) VALUES (?,?,?)");
+    if(!$st) return false;
+    $st->bind_param('sss',$fkVal,$newStatus,$note);
+  } else {
+    $st=$conn->prepare("INSERT INTO `$APR_TBL` (`$APR_UID`, `$APR_STATUS`) VALUES (?,?)");
+    if(!$st) return false;
+    $st->bind_param('ss',$fkVal,$newStatus);
+  }
   $ok=$st->execute(); $st->close(); return $ok;
 }
 
@@ -310,8 +322,8 @@ $flash = $_SESSION['flash'] ?? null; unset($_SESSION['flash']);
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   if (!csrf_ok($_POST['csrf'] ?? '')) { http_response_code(400); die('CSRF validation failed'); }
   $action = $_POST['action'] ?? '';
-  $uid    = (int)($_POST['user_id'] ?? 0);
-  if ($uid<=0){ $_SESSION['flash']=['type'=>'error','msg'=>'Invalid user.']; header('Location: customer_approvals.php'); exit(); }
+  $uid    = trim((string)($_POST['user_id'] ?? ''));
+  if ($uid === ''){ $_SESSION['flash']=['type'=>'error','msg'=>'Invalid user.']; header('Location: customer_approvals.php'); exit(); }
 
   if ($action==='approve'){
     $ok1 = set_user_status($conn,$uid,'active',$U_TBL,$U_STATUS,$U_ACTIVE,$U_APPROVED,$U_ID);
@@ -326,13 +338,13 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $_SESSION['flash']=['type'=>($ok1||$ok2)?'success':'error','msg'=>($ok1||$ok2)?'User disabled.':'Disable failed.'];
 
   } elseif ($action==='delete'){
-    if ($HAS_PROFILES){ $d=$conn->prepare("DELETE FROM customer_profiles WHERE user_id=?"); if($d){ $d->bind_param('i',$uid); @$d->execute(); $d->close(); } }
+    if ($HAS_PROFILES){ $d=$conn->prepare("DELETE FROM customer_profiles WHERE user_id=?"); if($d){ $d->bind_param('s',$uid); @$d->execute(); $d->close(); } }
     if ($APR_TBL && $APR_UID){
       $val = map_approval_fk_for_user($conn,$uid,$APR_UID,$C_TBL,$C_ID,$C_UID) ?? $uid;
-      $d=$conn->prepare("DELETE FROM `$APR_TBL` WHERE `$APR_UID`=?"); if($d){ $d->bind_param('i',$val); @$d->execute(); $d->close(); }
+      $d=$conn->prepare("DELETE FROM `$APR_TBL` WHERE `$APR_UID`=?"); if($d){ $d->bind_param('s',$val); @$d->execute(); $d->close(); }
     }
     $d=$conn->prepare("DELETE FROM `$U_TBL` WHERE `$U_ID`=?");
-    $ok=$d && $d->bind_param('i',$uid) && $d->execute(); if($d) $d->close();
+    $ok=$d && $d->bind_param('s',$uid) && $d->execute(); if($d) $d->close();
     $_SESSION['flash']=['type'=>$ok?'success':'error','msg'=>$ok?'User deleted.':'Delete failed (FK?).'];
   }
   header('Location: customer_approvals.php'); exit();
@@ -519,7 +531,7 @@ include __DIR__ . '/inc/layout_head.php';
             <td class="text-end">
               <button class="btn btn-sm btn-outline-secondary me-1"
                       data-bs-toggle="modal" data-bs-target="#viewModal"
-                      data-id="<?php echo (int)$r['uid']; ?>">
+                      data-id="<?php echo h($r['uid']); ?>">
                 <i class="fa fa-eye"></i>
               </button>
 
@@ -527,7 +539,7 @@ include __DIR__ . '/inc/layout_head.php';
               <form class="d-inline js-confirm" method="post" data-message="Approve this customer account?">
                 <input type="hidden" name="csrf" value="<?php echo h($_SESSION['csrf']); ?>">
                 <input type="hidden" name="action" value="approve">
-                <input type="hidden" name="user_id" value="<?php echo (int)$r['uid']; ?>">
+                <input type="hidden" name="user_id" value="<?php echo h($r['uid']); ?>">
                 <button class="btn btn-sm btn-outline-dark"><i class="fa fa-check"></i></button>
               </form>
               <?php endif; ?>
@@ -536,7 +548,7 @@ include __DIR__ . '/inc/layout_head.php';
               <form class="d-inline js-confirm ms-1" method="post" data-message="Disable this customer account?">
                 <input type="hidden" name="csrf" value="<?php echo h($_SESSION['csrf']); ?>">
                 <input type="hidden" name="action" value="disable">
-                <input type="hidden" name="user_id" value="<?php echo (int)$r['uid']; ?>">
+                <input type="hidden" name="user_id" value="<?php echo h($r['uid']); ?>">
                 <button class="btn btn-sm btn-outline-warning"><i class="fa fa-ban"></i></button>
               </form>
               <?php endif; ?>
@@ -544,7 +556,7 @@ include __DIR__ . '/inc/layout_head.php';
               <form class="d-inline js-confirm ms-1" method="post" data-message="Delete this user permanently? This cannot be undone.">
                 <input type="hidden" name="csrf" value="<?php echo h($_SESSION['csrf']); ?>">
                 <input type="hidden" name="action" value="delete">
-                <input type="hidden" name="user_id" value="<?php echo (int)$r['uid']; ?>">
+                <input type="hidden" name="user_id" value="<?php echo h($r['uid']); ?>">
                 <button class="btn btn-sm btn-outline-danger"><i class="fa fa-trash"></i></button>
               </form>
             </td>
