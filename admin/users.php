@@ -1,10 +1,9 @@
 <?php
 // =====================================================================
 // /admin/users.php — schema-aware Users list (no auth enforcement)
-// - No calls to require_admin() / require_login() to avoid redirects/notices
 // - Robust include of common.php (root /inc first, then /admin/inc fallback)
-// - Status toggles: AUTO-map to valid enum values in your schema
-// - Create: picks valid default status based on your enum; no more "invalid"
+// - Status toggles: AUTO-map to valid enum values with correct CASE
+// - Create/Approve/Disable: stores EXACT ENUM token from schema
 // =====================================================================
 
 // ---- Robust common include: prefer ROOT /inc/common.php, fallback to /admin/inc/common.php
@@ -85,27 +84,44 @@ function split_name($full){
   $p=explode(' ',$full); $first=array_shift($p); return [$first,implode(' ',$p)];
 }
 
-/** Read enum allowed set for a column. Returns array of lowercase strings. */
-function enum_values(mysqli $c, string $table, string $col): array {
-  $sql="SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?";
-  $st=$c->prepare($sql); if(!$st) return [];
+/**
+ * Return column meta: ['type' => 'enum(...)'|'varchar...'|..., 'enum_map' => [lower=>exact, ...]]
+ * enum_map preserves original CASE for saving; keys are lowercase for matching.
+ */
+function column_meta(mysqli $c, string $table, string $col): array {
+  $sql="SELECT DATA_TYPE, COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1";
+  $st=$c->prepare($sql); if(!$st) return ['type'=>null,'enum_map'=>[]];
   $st->bind_param('ss',$table,$col); $st->execute();
-  $typ=$st->get_result()->fetch_row()[0] ?? ''; $st->close();
-  if (stripos($typ,'enum(')!==0) return [];
-  $inside = trim(substr($typ,5,-1)); // inside quotes
-  $vals=[];
-  foreach (preg_split('/,(?=(?:[^\'"]|\'[^\']*\'|"[^"]*")*$)/',$inside) as $v){
-    $v=trim($v," \t\n\r\0\x0B'\"");
-    if ($v!=='') $vals[]=strtolower($v);
+  $row=$st->get_result()->fetch_assoc() ?: []; $st->close();
+  $dataType = strtolower((string)($row['DATA_TYPE']??''));
+  $colType  = (string)($row['COLUMN_TYPE']??'');
+  $map=[];
+  if ($dataType==='enum' && stripos($colType,'enum(')===0){
+    // parse ENUM('A','B','C')
+    $inside = trim(substr($colType,5,-1));
+    // split by commas not inside quotes
+    $parts = preg_split('/,(?=(?:[^\'"]|\'[^\']*\'|"[^"]*")*$)/',$inside);
+    foreach ($parts as $p){
+      $tok = trim($p," \t\n\r\0\x0B'\"");
+      if ($tok!=='') $map[strtolower($tok)] = $tok; // key: lower, val: exact
+    }
   }
-  return $vals;
+  return ['type'=>$colType, 'enum_map'=>$map];
 }
-/** Pick a valid status value from preferred list according to enum; returns null to skip writing. */
-function pick_status_for_action(array $enum, array $preferred): ?string {
-  if (!$enum) return $preferred[0] ?? null;
-  foreach ($preferred as $p) if (in_array(strtolower($p), $enum, true)) return strtolower($p);
-  // fallback to first enum value if nothing matches
-  return $enum[0] ?? null;
+/** Pick a legal status string from preferred list; returns EXACT token to save (from enum_map) */
+function pick_status_exact(array $enum_map, array $preferred, ?string $fallback=null): ?string {
+  if ($enum_map){
+    foreach ($preferred as $p){
+      $k = strtolower($p);
+      if (isset($enum_map[$k])) return $enum_map[$k]; // exact-case token
+    }
+    // fallback to first enum if still nothing
+    $first = reset($enum_map);
+    return $first!==false ? $first : null;
+  }
+  // non-enum: return preferred[0] or fallback
+  return $preferred[0] ?? $fallback;
 }
 
 // ---------- Users schema map ----------
@@ -156,7 +172,7 @@ $has_updated_at = colExists($conn,$U_TBL,'updated_at');
 $orderExpr      = $created_col ? "`$created_col` DESC, `$U_PK` DESC" : "`$U_PK` DESC";
 
 // status support
-$status_col       = colExists($conn,$U_TBL,'status') ? 'status' : null; // enum?
+$status_col       = colExists($conn,$U_TBL,'status') ? 'status' : null; // may be ENUM or VARCHAR
 $gate_active_col  = colExists($conn,$U_TBL,'is_active')   ? 'is_active'
                   : (colExists($conn,$U_TBL,'active')     ? 'active'
                   : (colExists($conn,$U_TBL,'enabled')    ? 'enabled' : null));
@@ -167,14 +183,19 @@ $gate_approve_col = colExists($conn,$U_TBL,'is_approved') ? 'is_approved'
 
 $supportToggle = (bool)($status_col || $gate_active_col || $gate_approve_col);
 
-// derive allowed enum values (lowercase) for status, if enum
-$STATUS_ENUM = $status_col ? enum_values($conn,$U_TBL,$status_col) : [];
+// column meta for status
+$STATUS_META   = $status_col ? column_meta($conn,$U_TBL,$status_col) : ['type'=>null,'enum_map'=>[]];
+$STATUS_ENUM_MAP = $STATUS_META['enum_map']; // [lower => ExactToken]
 
-// smart defaults based on enum values present
-$DEFAULT_PENDING  = pick_status_for_action($STATUS_ENUM, ['pending','inactive','disabled','active']);
-$VALUE_ACTIVE     = pick_status_for_action($STATUS_ENUM, ['active','enabled']);
-$VALUE_DISABLED   = pick_status_for_action($STATUS_ENUM, ['disabled','inactive']); // prefer 'disabled'
-if ($status_col && !$DEFAULT_PENDING) $status_col = null; // if we cannot pick a legal value, skip touching status
+// smart defaults (EXACT tokens)
+$DEFAULT_PENDING  = pick_status_exact($STATUS_ENUM_MAP, ['pending','inactive','disabled','new','unverified'], 'pending');
+$VALUE_ACTIVE     = pick_status_exact($STATUS_ENUM_MAP, ['active','enabled','approved'], 'active');
+$VALUE_DISABLED   = pick_status_exact($STATUS_ENUM_MAP, ['disabled','inactive','rejected','blocked','banned'], 'disabled');
+
+// if status exists but we could not pick any (rare), skip writing status to avoid invalid enum
+if ($status_col && !$DEFAULT_PENDING && !$VALUE_ACTIVE && !$VALUE_DISABLED) {
+  $status_col = null;
+}
 
 $HAS_CO = tableExists($conn,'customer_orders') && colExists($conn,'customer_orders','customer_id');
 
@@ -184,7 +205,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
   $action = $_POST['action'] ?? '';
 
   if ($action==='create') {
-    if (!$has_username || !$pwd_col) { flash_set('error','Create not available: users.username/user_name or password column missing.'); header('Location: users.php'); exit; }
+    if (!$has_username || !$pwd_col) { flash_set('error','Create not available: username/user_name or password column missing.'); header('Location: users.php'); exit; }
 
     $username = trim($_POST['username'] ?? '');
     $email    = trim($_POST['email'] ?? '');
@@ -233,7 +254,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
                                           if ($has_ln){ $fields[]='`last_name`';  $place[]='?'; $types.='s'; $vals[]=$ln; } }
     if ($has_role_col) { $fields[]='`role`'; $place[]='?'; $types.='s'; $vals[]=$role; }
 
-    // Defaults for status/gates (use legal enum values)
+    // Defaults for status/gates (use EXACT enum token)
     if ($status_col && $DEFAULT_PENDING){ $fields[]="`$status_col`"; $place[]='?'; $types.='s'; $vals[]=$DEFAULT_PENDING; }
     if ($gate_active_col) { $fields[]="`$gate_active_col`"; $place[]='?'; $types.='i'; $vals[]=0; }
     if ($gate_approve_col){ $fields[]="`$gate_approve_col`";$place[]='?'; $types.='i'; $vals[]=0; }
@@ -278,8 +299,9 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $toActive = ($action==='approve');
     $parts=[]; $types=''; $vals=[];
     if ($status_col) {
-      $parts[]="`$status_col`=?"; $types.='s';
-      $vals[] = $toActive ? ($VALUE_ACTIVE ?? 'active') : ($VALUE_DISABLED ?? 'disabled');
+      // choose exact-case token for approve/disable
+      $target = $toActive ? ($VALUE_ACTIVE ?: 'active') : ($VALUE_DISABLED ?: 'disabled');
+      $parts[]="`$status_col`=?"; $types.='s'; $vals[]=$target;
     }
     if ($gate_active_col) { $parts[]="`$gate_active_col`=?"; $types.='i'; $vals[]=$toActive?1:0; }
     if ($gate_approve_col){ $parts[]="`$gate_approve_col`=?";$types.='i'; $vals[]=$toActive?1:0; }
@@ -366,7 +388,7 @@ $st = $conn->prepare($sql);
 if ($bind!=='') $st->bind_param($bind, ...$args);
 $st->execute(); $rows=$st->get_result()->fetch_all(MYSQLI_ASSOC); $st->close();
 
-// ---------- Flash (suppress auth-related leftovers) ----------
+// ---------- Flash ----------
 $flash = flash_get();
 if ($flash) {
   $msg = trim((string)($flash['msg'] ?? $flash['m'] ?? ''));
@@ -453,14 +475,15 @@ include __DIR__ . '/inc/layout_head.php';
           // Determine display status
           $dispStatus = '—';
           if (isset($u['u_status']) && $u['u_status']!=='') {
-            $val = strtolower((string)$u['u_status']);
-            $dispStatus = $val;
+            $dispStatus = (string)$u['u_status'];
           } elseif (isset($u['u_active']) || isset($u['u_approved'])) {
             $isActive = isset($u['u_active']) ? ((int)$u['u_active']===1) : null;
             $isAppr   = isset($u['u_approved']) ? ((int)$u['u_approved']===1) : null;
             $dispStatus = ($isActive===1 || $isAppr===1) ? 'active' : 'pending';
           }
-          $color = $dispStatus==='active' ? 'success' : (in_array($dispStatus,['inactive','disabled']) ? 'secondary' : 'warning');
+          $lc = strtolower($dispStatus);
+          $color = ($lc==='active') ? 'success'
+                 : (in_array($lc,['inactive','disabled','rejected','blocked','banned']) ? 'secondary' : 'warning');
           $hasOrders = $HAS_CO ? ((int)($u['orders_ct'] ?? 0) > 0) : false;
         ?>
           <tr>
@@ -470,7 +493,7 @@ include __DIR__ . '/inc/layout_head.php';
             <td><span class="badge text-bg-<?=$color?>"><?=h(ucfirst($dispStatus))?></span></td>
             <td class="text-end">
               <?php if ($supportToggle): ?>
-                <?php if ($dispStatus!=='active'): ?>
+                <?php if (strtolower($dispStatus)!=='active'): ?>
                 <form method="post" class="d-inline js-confirm" data-message="Approve this user?">
                   <input type="hidden" name="csrf" value="<?=h($_SESSION['csrf'])?>">
                   <input type="hidden" name="action" value="approve">
@@ -478,7 +501,7 @@ include __DIR__ . '/inc/layout_head.php';
                   <button class="btn btn-sm btn-outline-success" title="Approve"><i class="fa fa-check"></i></button>
                 </form>
                 <?php endif; ?>
-                <?php if ($dispStatus==='active' || $dispStatus==='pending' || $dispStatus==='inactive'): ?>
+                <?php if (in_array(strtolower($dispStatus),['active','pending','inactive'])): ?>
                 <form method="post" class="d-inline js-confirm ms-1" data-message="Disable this user?">
                   <input type="hidden" name="csrf" value="<?=h($_SESSION['csrf'])?>">
                   <input type="hidden" name="action" value="disable">
