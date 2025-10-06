@@ -19,7 +19,7 @@ $conn->set_charset('utf8mb4');
 @$conn->query("SET time_zone = '+08:00'");
 
 // Fingerprint agent (Windows) endpoint:
-define('FPGRAB_ENDPOINT', 'http://YOUR_WINDOWS_PC_PUBLIC_IP_OR_DNS:8080/grab'); // hal. http://203.0.113.50:8080/grab
+define('FPGRAB_ENDPOINT', 'http:10.62.130.102:8080/grab'); // hal. http://203.0.113.50:8080/grab
 
 // Shared secret token (dapat tugma sa Windows agent)
-define('FPGRAB_TOKEN', 'your-secret-token-here');
+define('FPGRAB_TOKEN', 'super-secret-123');
