@@ -1,28 +1,49 @@
 <?php
-// accountant/customer_orders.php — Accountant view of Customer Orders (robust + null-safe)
+// accountant/customer_orders.php — Accountant view of Customer Orders (null-safe + robust)
 declare(strict_types=1);
 
 $PAGE_TITLE = 'Customer Orders';
 $CURRENT    = 'customer_orders.php';
 
-// 1) Make sure $conn exists (comes from accountant/inc/common.php which requires your root config.php)
-require_once __DIR__ . '/inc/common.php';
-
-// 2) Then load your header (it may also expect $conn/session already initialized)
-require_once __DIR__ . '/layout_head.php';
+/* 1) Ensure DB connection is available */
+require_once __DIR__ . '/inc/common.php';   // builds $conn from your root config.php
 
 @date_default_timezone_set('Asia/Manila');
-if (isset($conn) && $conn instanceof mysqli) {
-  @$conn->query("SET time_zone = '+08:00'");
-  @$conn->set_charset('utf8mb4');
+
+/* Last-resort fallback if somehow $conn wasn't created by common.php */
+if (!isset($conn) || !($conn instanceof mysqli)) {
+  if (defined('DB_HOST') && defined('DB_USER') && defined('DB_PASS') && defined('DB_NAME')) {
+    mysqli_report(MYSQLI_REPORT_OFF);
+    $port = defined('DB_PORT') ? (int)DB_PORT : 3306;
+    $tmp  = @new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME, $port);
+    if ($tmp instanceof mysqli && !$tmp->connect_errno) {
+      @$tmp->set_charset('utf8mb4');
+      @$tmp->query("SET time_zone = '+08:00'");
+      $conn = $tmp;
+    }
+  }
 }
+
+/* If still no connection, bail safely */
+if (!($conn instanceof mysqli)) {
+  require_once __DIR__ . '/layout_head.php';
+  echo '<div class="container"><div class="alert alert-danger mt-3">Database connection not available. Check config.php and inc/common.php.</div></div>';
+  echo '</main></body></html>';
+  exit;
+}
+
+/* Now that $conn is guaranteed, load the header (it may rely on $conn/session) */
+require_once __DIR__ . '/layout_head.php';
+
+@$conn->query("SET time_zone = '+08:00'");
+@$conn->set_charset('utf8mb4');
 mysqli_report(MYSQLI_REPORT_OFF);
 
 /* ---------- Tiny utils ---------- */
 if (!function_exists('h'))    { function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); } }
 if (!function_exists('peso')) { function peso($n){ return '₱' . number_format((float)$n, 2); } }
 
-/* ---------- Null-safe INFORMATION_SCHEMA helpers ---------- */
+/* ---------- INFORMATION_SCHEMA helpers (NULL-SAFE) ---------- */
 function tbl_exists(?mysqli $c, string $t): bool {
   if (!$c instanceof mysqli) return false;
   $sql = "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? LIMIT 1";
@@ -54,26 +75,7 @@ function find_orders_table(?mysqli $c): ?string {
   return null;
 }
 
-/* ---------- Make absolutely sure $conn exists (fallback if some header replaced it) ---------- */
-if (!isset($conn) || !($conn instanceof mysqli)) {
-  // Last-resort: connect using DB_* from config.php (already required by inc/common.php)
-  if (defined('DB_HOST') && defined('DB_USER') && defined('DB_PASS') && defined('DB_NAME')) {
-    $port = defined('DB_PORT') ? (int)DB_PORT : 3306;
-    $conn = @new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME, $port);
-    if ($conn instanceof mysqli && !$conn->connect_errno) {
-      @$conn->set_charset('utf8mb4');
-      @$conn->query("SET time_zone = '+08:00'");
-    }
-  }
-}
-
-/* ---------- If still no DB, bail with a friendly message ---------- */
-if (!($conn instanceof mysqli)) {
-  echo '<div class="container"><div class="alert alert-danger mt-3">Database connection not available. Check config.php and inc/common.php.</div></div></main></body></html>';
-  exit;
-}
-
-/* ---------- Discover table & columns (same style as your dashboard) ---------- */
+/* ---------- Discover table & columns ---------- */
 $T = find_orders_table($conn);
 if (!$T) {
   $db = ''; if ($r=$conn->query("SELECT DATABASE()")) { $db=(string)($r->fetch_row()[0]??''); }
@@ -223,6 +225,9 @@ if ($STATUS) {
 }
 
 /* ---------- Fetch list ---------- */
+$from = isset($from) ? $from : date('Y-m-01');
+$to   = isset($to)   ? $to   : date('Y-m-d');
+
 $where = $DATEC ? "WHERE DATE(`$DATEC`) BETWEEN ? AND ?" : "WHERE 1";
 $params=[]; $types='';
 if ($DATEC){ $params=[$from,$to]; $types='ss'; }
@@ -357,8 +362,52 @@ if ($TOTAL) {
   </div>
 </div>
 
-<!-- Modal + JS identical to previous version (omitted for brevity),
-     keep your existing script block for actions/view items -->
+<!-- Detail Modal + JS (same as your previous) -->
+<div class="modal fade" id="orderModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">Order Details</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body"><div id="orderItems">Loading…</div></div>
+      <div class="modal-footer"><button class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+    </div>
+  </div>
+</div>
+
+<script>
+function postJSON(data){
+  return fetch('', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: new URLSearchParams(data) })
+    .then(r=>r.json());
+}
+function toast(msg){
+  if (window.Swal && Swal.fire){ Swal.fire({toast:true,position:'top',timer:1500,showConfirmButton:false,icon:'success',title:msg}); }
+  else { console.log(msg); }
+}
+function markPaid(id){ postJSON({action:'mark_paid', id}).then(res=>{ if(res.ok){ toast('Marked paid'); location.reload(); } else alert('Failed'); }); }
+function approveOrder(id){ postJSON({action:'approve', id}).then(res=>{ if(res.ok){ toast('Order approved'); location.reload(); } else alert('Failed'); }); }
+function markDone(id){ postJSON({action:'mark_done', id}).then(res=>{ if(res.ok){ toast('Order marked done'); location.reload(); } else alert('Failed'); }); }
+function setStatus(id,status){ postJSON({action:'set_status', id, status}).then(res=>{ if(res.ok){ toast('Status updated'); location.reload(); } else alert('Failed'); }); }
+function viewOrder(id){
+  postJSON({action:'view', id}).then(res=>{
+    const box = document.getElementById('orderItems');
+    if(!res.ok){ box.textContent='No details.'; return; }
+    if(!res.items || !res.items.length){ box.textContent='No items recorded for this order.'; }
+    else{
+      let html = '<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Item</th><th class="text-end">Qty</th><th class="text-end">Unit</th><th class="text-end">Line</th></tr></thead><tbody>';
+      res.items.forEach(x=>{
+        const name = x.item_name ?? '(item)';
+        const qty  = Number(x.qty ?? 1);
+        const unit = Number(x.unit_price ?? 0);
+        html += `<tr><td>${name}</td><td class="text-end">${qty}</td><td class="text-end">₱${unit.toFixed(2)}</td><td class="text-end">₱${(qty*unit).toFixed(2)}</td></tr>`;
+      });
+      html += '</tbody></table></div>';
+      box.innerHTML = html;
+    }
+    new bootstrap.Modal(document.getElementById('orderModal')).show();
+  });
+}
+</script>
+
 <?php // FOOTER SCRIPTS ?>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </main>
