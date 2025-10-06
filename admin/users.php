@@ -3,7 +3,7 @@
 // /admin/users.php — schema-aware Users list (no auth enforcement)
 // - Robust include of common.php (root /inc first, then /admin/inc fallback)
 // - Status toggles: AUTO-map to valid enum values with correct CASE
-// - Create/Approve/Disable: stores EXACT ENUM token from schema
+// - Create/Approve/Disable/Delete: works for numeric OR string (UUID) PKs
 // =====================================================================
 
 // ---- Robust common include: prefer ROOT /inc/common.php, fallback to /admin/inc/common.php
@@ -98,13 +98,11 @@ function column_meta(mysqli $c, string $table, string $col): array {
   $colType  = (string)($row['COLUMN_TYPE']??'');
   $map=[];
   if ($dataType==='enum' && stripos($colType,'enum(')===0){
-    // parse ENUM('A','B','C')
     $inside = trim(substr($colType,5,-1));
-    // split by commas not inside quotes
     $parts = preg_split('/,(?=(?:[^\'"]|\'[^\']*\'|"[^"]*")*$)/',$inside);
     foreach ($parts as $p){
       $tok = trim($p," \t\n\r\0\x0B'\"");
-      if ($tok!=='') $map[strtolower($tok)] = $tok; // key: lower, val: exact
+      if ($tok!=='') $map[strtolower($tok)] = $tok;
     }
   }
   return ['type'=>$colType, 'enum_map'=>$map];
@@ -114,14 +112,24 @@ function pick_status_exact(array $enum_map, array $preferred, ?string $fallback=
   if ($enum_map){
     foreach ($preferred as $p){
       $k = strtolower($p);
-      if (isset($enum_map[$k])) return $enum_map[$k]; // exact-case token
+      if (isset($enum_map[$k])) return $enum_map[$k];
     }
-    // fallback to first enum if still nothing
     $first = reset($enum_map);
     return $first!==false ? $first : null;
   }
-  // non-enum: return preferred[0] or fallback
   return $preferred[0] ?? $fallback;
+}
+
+/** Detect if PK is numeric by checking DATA_TYPE */
+function pk_info(mysqli $c, string $table, string $pkcol): array {
+  $sql="SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1";
+  $st=$c->prepare($sql); if(!$st) return ['numeric'=>true,'bind'=>'i'];
+  $st->bind_param('ss',$table,$pkcol); $st->execute();
+  $row=$st->get_result()->fetch_assoc(); $st->close();
+  $dt=strtolower((string)($row['DATA_TYPE']??'int'));
+  $numeric = in_array($dt, ['int','bigint','smallint','mediumint','tinyint','decimal','double','float'], true);
+  return ['numeric'=>$numeric,'bind'=>$numeric?'i':'s'];
 }
 
 // ---------- Users schema map ----------
@@ -132,6 +140,9 @@ $U_PK  = colExists($conn,$U_TBL,'id') ? 'id' :
          (colExists($conn,$U_TBL,'user_id') ? 'user_id' :
          (colExists($conn,$U_TBL,'uid') ? 'uid' :
          (colExists($conn,$U_TBL,'users_id') ? 'users_id' : 'id')));
+$PKI = pk_info($conn,$U_TBL,$U_PK);
+$PK_IS_NUM = $PKI['numeric'];
+$PK_BIND   = $PKI['bind']; // 'i' or 's'
 
 // username
 $uname_col = colExists($conn,$U_TBL,'username') ? 'username' :
@@ -184,7 +195,7 @@ $gate_approve_col = colExists($conn,$U_TBL,'is_approved') ? 'is_approved'
 $supportToggle = (bool)($status_col || $gate_active_col || $gate_approve_col);
 
 // column meta for status
-$STATUS_META   = $status_col ? column_meta($conn,$U_TBL,$status_col) : ['type'=>null,'enum_map'=>[]];
+$STATUS_META     = $status_col ? column_meta($conn,$U_TBL,$status_col) : ['type'=>null,'enum_map'=>[]];
 $STATUS_ENUM_MAP = $STATUS_META['enum_map']; // [lower => ExactToken]
 
 // smart defaults (EXACT tokens)
@@ -203,6 +214,18 @@ $HAS_CO = tableExists($conn,'customer_orders') && colExists($conn,'customer_orde
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   if (!csrf_valid($_POST['csrf'] ?? '')) { http_response_code(400); die('CSRF validation failed'); }
   $action = $_POST['action'] ?? '';
+
+  // Helper: fetch and validate incoming PK value respecting PK type
+  $get_pk = function(string $field='id') use ($PK_IS_NUM) {
+    $raw = $_POST[$field] ?? '';
+    if ($PK_IS_NUM) {
+      $v = (int)$raw;
+      return ($v>0) ? $v : null;
+    } else {
+      $v = trim((string)$raw);
+      return ($v!=='') ? $v : null;
+    }
+  };
 
   if ($action==='create') {
     if (!$has_username || !$pwd_col) { flash_set('error','Create not available: username/user_name or password column missing.'); header('Location: users.php'); exit; }
@@ -271,10 +294,12 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
   if ($action==='reset_password') {
     if (!$pwd_col){ flash_set('error','Reset not available: no password column.'); header('Location: users.php'); exit; }
-    $id = (int)($_POST['id'] ?? 0); if ($id<=0){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
+    $id = $get_pk('id');
+    if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
     $hash = password_hash('password', PASSWORD_BCRYPT);
     $sql  = "UPDATE `$U_TBL` SET `$pwd_col`=?, ".($has_updated_at?'`updated_at`=NOW(), ':'')."`$U_PK`=`$U_PK` WHERE `$U_PK`=?";
-    $st   = $conn->prepare($sql); $st->bind_param('si',$hash,$id);
+    $st   = $conn->prepare($sql);
+    $st->bind_param('s'.$PK_BIND, $hash, $id);
     $ok   = $st->execute(); $st->close();
     flash_set($ok?'success':'error',$ok?"Password reset to <code>password</code>.":'Reset failed.');
     header('Location: users.php'); exit;
@@ -282,16 +307,21 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
   if ($action==='approve' || $action==='disable') {
     if (!$supportToggle){ flash_set('error','Status toggle not supported by current users schema.'); header('Location: users.php'); exit; }
-    $id = (int)($_POST['id'] ?? 0); if ($id<=0){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
+    $id = $get_pk('id');
+    if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
 
-    // Prevent disabling last admin / self (if role column exists)
+    // Prevent disabling last admin / self (if role column exists) — only when PK is numeric doesn't matter, bind safely
     if ($has_role_col && $action==='disable') {
-      $q=$conn->prepare("SELECT `role` FROM `$U_TBL` WHERE `$U_PK`=?"); $q->bind_param('i',$id); $q->execute();
+      $q=$conn->prepare("SELECT `role` FROM `$U_TBL` WHERE `$U_PK`=?");
+      $q->bind_param($PK_BIND,$id); $q->execute();
       $role=strtolower($q->get_result()->fetch_assoc()['role'] ?? ''); $q->close();
       if ($role==='admin') {
         $adminCount=(int)scalar($conn,"SELECT COUNT(*) FROM `$U_TBL` WHERE `role`='admin'");
-        $actingId=(int)($_SESSION['user_id'] ?? 0);
-        if ($id===$actingId){ flash_set('error','You cannot disable your own admin account.'); header('Location: users.php'); exit; }
+        $actingId = $_SESSION['user_id'] ?? null;
+        if ($actingId!==null) {
+          // compare as strings to be safe
+          if ((string)$id === (string)$actingId){ flash_set('error','You cannot disable your own admin account.'); header('Location: users.php'); exit; }
+        }
         if ($adminCount<=1){ flash_set('error','Cannot disable the last remaining admin.'); header('Location: users.php'); exit; }
       }
     }
@@ -299,39 +329,46 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $toActive = ($action==='approve');
     $parts=[]; $types=''; $vals=[];
     if ($status_col) {
-      // choose exact-case token for approve/disable
       $target = $toActive ? ($VALUE_ACTIVE ?: 'active') : ($VALUE_DISABLED ?: 'disabled');
       $parts[]="`$status_col`=?"; $types.='s'; $vals[]=$target;
     }
     if ($gate_active_col) { $parts[]="`$gate_active_col`=?"; $types.='i'; $vals[]=$toActive?1:0; }
-    if ($gate_approve_col){ $parts[]="`$gate_approve_col`=?";$types.='i'; $vals[]=$toActive?1:0; }
+    if ($gate_approve_col){ $parts[]="`$gate_approve_col`=?"; $types.='i'; $vals[]=$toActive?1:0; }
     if ($has_updated_at)  { $parts[]="`updated_at`=NOW()"; }
     $sql="UPDATE `$U_TBL` SET ".implode(',',$parts)." WHERE `$U_PK`=?";
-    $types.='i'; $vals[]=$id; $st=$conn->prepare($sql); $st->bind_param($types, ...$vals);
+    $types.=$PK_BIND; $vals[]=$id;
+    $st=$conn->prepare($sql); $st->bind_param($types, ...$vals);
     $ok=$st->execute(); $err=$conn->error; $st->close();
     flash_set($ok?'success':'error', $ok?ucfirst($action).'d.':(ucfirst($action).' failed. '.$err));
     header('Location: users.php'); exit;
   }
 
   if ($action==='delete') {
-    $id = (int)($_POST['id'] ?? 0); if ($id<=0){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
-    $actingId = (int)($_SESSION['user_id'] ?? 0);
-    if ($id === $actingId){ flash_set('error','You cannot delete your own account.'); header('Location: users.php'); exit; }
+    $id = $get_pk('id');
+    if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
+
+    // Prevent self-delete if we can compare (string-safe)
+    $actingId = $_SESSION['user_id'] ?? null;
+    if ($actingId!==null && (string)$id === (string)$actingId){ flash_set('error','You cannot delete your own account.'); header('Location: users.php'); exit; }
+
     if ($has_role_col) {
-      $q=$conn->prepare("SELECT `role` FROM `$U_TBL` WHERE `$U_PK`=?"); $q->bind_param('i',$id); $q->execute();
+      $q=$conn->prepare("SELECT `role` FROM `$U_TBL` WHERE `$U_PK`=?");
+      $q->bind_param($PK_BIND,$id); $q->execute();
       $role=strtolower($q->get_result()->fetch_assoc()['role'] ?? ''); $q->close();
       if ($role==='admin') {
         $adminCount=(int)scalar($conn,"SELECT COUNT(*) FROM `$U_TBL` WHERE `role`='admin'");
         if ($adminCount<=1){ flash_set('error','Cannot delete the last remaining admin.'); header('Location: users.php'); exit; }
       }
     }
+
     if ($HAS_CO) {
       $st=$conn->prepare("SELECT COUNT(*) c FROM `customer_orders` WHERE `customer_id`=?");
-      $st->bind_param('i',$id); $st->execute();
+      $st->bind_param($PK_BIND,$id); $st->execute();
       $c=(int)($st->get_result()->fetch_assoc()['c'] ?? 0); $st->close();
       if ($c>0){ flash_set('error','Cannot delete: user has linked orders. Disable instead.'); header('Location: users.php'); exit; }
     }
-    $st = $conn->prepare("DELETE FROM `$U_TBL` WHERE `$U_PK`=? LIMIT 1"); $st->bind_param('i',$id);
+
+    $st = $conn->prepare("DELETE FROM `$U_TBL` WHERE `$U_PK`=? LIMIT 1"); $st->bind_param($PK_BIND,$id);
     $ok = $st->execute(); $aff=$st->affected_rows; $st->close();
     flash_set(($ok && $aff>0)?'success':'error', ($ok && $aff>0)?'User deleted.' : 'Delete failed.');
     header('Location: users.php'); exit;
@@ -497,7 +534,7 @@ include __DIR__ . '/inc/layout_head.php';
                 <form method="post" class="d-inline js-confirm" data-message="Approve this user?">
                   <input type="hidden" name="csrf" value="<?=h($_SESSION['csrf'])?>">
                   <input type="hidden" name="action" value="approve">
-                  <input type="hidden" name="id" value="<?= (int)$u['id'] ?>">
+                  <input type="hidden" name="id" value="<?= h($u['id']) ?>">
                   <button class="btn btn-sm btn-outline-success" title="Approve"><i class="fa fa-check"></i></button>
                 </form>
                 <?php endif; ?>
@@ -505,7 +542,7 @@ include __DIR__ . '/inc/layout_head.php';
                 <form method="post" class="d-inline js-confirm ms-1" data-message="Disable this user?">
                   <input type="hidden" name="csrf" value="<?=h($_SESSION['csrf'])?>">
                   <input type="hidden" name="action" value="disable">
-                  <input type="hidden" name="id" value="<?= (int)$u['id'] ?>">
+                  <input type="hidden" name="id" value="<?= h($u['id']) ?>">
                   <button class="btn btn-sm btn-outline-warning" title="Disable"><i class="fa fa-ban"></i></button>
                 </form>
                 <?php endif; ?>
@@ -516,14 +553,14 @@ include __DIR__ . '/inc/layout_head.php';
                     <?= $pwd_col ? '' : 'onsubmit="return false" title="No password column"' ?>>
                 <input type="hidden" name="csrf" value="<?=h($_SESSION['csrf'])?>">
                 <input type="hidden" name="action" value="reset_password">
-                <input type="hidden" name="id" value="<?= (int)$u['id'] ?>">
+                <input type="hidden" name="id" value="<?= h($u['id']) ?>">
                 <button class="btn btn-sm btn-outline-dark" <?= $pwd_col?'':'disabled' ?> title="Reset Password"><i class="fa fa-key"></i></button>
               </form>
 
               <!-- Delete -->
               <button class="btn btn-sm btn-outline-danger ms-1"
                       data-bs-toggle="modal" data-bs-target="#deleteModal"
-                      data-id="<?= (int)$u['id'] ?>"
+                      data-id="<?= h($u['id']) ?>"
                       data-username="<?= h($u['username']) ?>"
                       data-role="<?= h($u['role']) ?>"
                       <?= $hasOrders ? 'disabled title="Has orders; cannot delete"' : '' ?>>
