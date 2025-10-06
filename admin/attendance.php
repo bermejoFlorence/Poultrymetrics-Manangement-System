@@ -66,7 +66,7 @@ function dtr_overlap_mins(?int $a1, ?int $a2, int $b1, int $b2): int {
   return ($e > $s) ? (int)floor(($e - $s)/60) : 0;
 }
 
-/* Sum minutes for completed AM/PM pairs inside schedule windows */
+/* Sum minutes for completed AM/PM pairs inside schedule windows (total only) */
 function completed_work_mins(string $date, array $row, array $sched): int {
   $ai = ts_from_date_and_val($date, $row['am_in']  ?? null);
   $ao = ts_from_date_and_val($date, $row['am_out'] ?? null);
@@ -82,6 +82,24 @@ function completed_work_mins(string $date, array $row, array $sched): int {
   if ($ai && $ao && $ao > $ai) $mins += dtr_overlap_mins($ai,$ao,$sam,$eam);
   if ($pi && $po && $po > $pi) $mins += dtr_overlap_mins($pi,$po,$spm,$epm);
   return $mins;
+}
+
+/* NEW: return AM and PM pair minutes separately (for half-day rule) */
+function completed_pair_mins(string $date, array $row, array $sched): array {
+  $ai = ts_from_date_and_val($date, $row['am_in']  ?? null);
+  $ao = ts_from_date_and_val($date, $row['am_out'] ?? null);
+  $pi = ts_from_date_and_val($date, $row['pm_in']  ?? null);
+  $po = ts_from_date_and_val($date, $row['pm_out'] ?? null);
+
+  $sam = strtotime("$date ".($sched['am_in']  ?? '07:00:00'));
+  $eam = strtotime("$date ".($sched['am_out'] ?? '11:00:00'));
+  $spm = strtotime("$date ".($sched['pm_in']  ?? '13:00:00'));
+  $epm = strtotime("$date ".($sched['pm_out'] ?? '17:00:00'));
+
+  $am = ($ai && $ao && $ao > $ai) ? dtr_overlap_mins($ai,$ao,$sam,$eam) : 0;
+  $pm = ($pi && $po && $po > $pi) ? dtr_overlap_mins($pi,$po,$spm,$epm) : 0;
+
+  return ['am'=>$am, 'pm'=>$pm, 'total'=>$am+$pm];
 }
 
 /* ---------------- Page config ---------------- */
@@ -477,17 +495,33 @@ include __DIR__.'/inc/layout_head.php';
                 $x = $attMonth[$date] ?? null;
 
                 if ($x) {
-                  $c = $service->computeDay($date,$x); // minutes: regular, deduct, ot
+                  // computeDay for OT minutes (we'll only use it when there's an OT pair)
+                  $c = $service->computeDay($date,$x); // ['regular','deduct','ot']
                   $paidFlag = (int)($x['paid'] ?? 0) === 1;
                 } else {
                   $c = ['regular'=>0,'deduct'=>0,'ot'=>0];
                   $paidFlag = false;
                 }
 
-                $compMins = $x ? completed_work_mins($date, $x, $WORK_SCHED) : 0;
+                // Completed pair minutes (AM/PM separately) for half-day logic
+                $pair = $x ? completed_pair_mins($date, $x, $WORK_SCHED) : ['am'=>0,'pm'=>0,'total'=>0];
+                $compMins = (int)$pair['total'];
+
+                // Required mins based on completed pairs:
+                // - none => 0 (no missing)
+                // - one  => 4h
+                // - two  => 8h
+                if ($pair['am'] > 0 && $pair['pm'] > 0) {
+                  $required = $REG_DAILY_MINS;        // 8h
+                } elseif ($pair['am'] > 0 || $pair['pm'] > 0) {
+                  $required = (int)($REG_DAILY_MINS/2); // 4h
+                } else {
+                  $required = 0;
+                }
+                $dayDeduct = max(0, $required - $compMins);
 
                 $totHours += $compMins;
-                $totLate  += (int)$c['deduct'];
+                $totLate  += $dayDeduct;
 
                 // Timestamps (for showing cells and deciding if OT pair exists)
                 $am_in_ts  = ts_from_date_and_val($date, $x['am_in']  ?? null);
@@ -515,8 +549,8 @@ include __DIR__.'/inc/layout_head.php';
                 <td><?= fmt_time_ampm($ot_out_ts) ?></td>
 
                 <td class="group-split muted-num"><?= $compMins>0 ? fmt_hhmm_from_mins($compMins) : '' ?></td>
-                <td class="muted-num <?= $c['deduct']>0?'text-danger fw-semibold':'' ?>">
-                  <?= fmt_hhmm_from_mins((int)$c['deduct']) ?>
+                <td class="muted-num <?= $dayDeduct>0?'text-danger fw-semibold':'' ?>">
+                  <?= fmt_hhmm_from_mins((int)$dayDeduct) ?>
                 </td>
                 <td class="muted-num"><?= $hasOTpair ? fmt_hhmm_from_mins($dayOT) : '' ?></td>
                 <td><span class="badge text-bg-<?=$paidFlag?'success':'secondary'?>"><?=$paidFlag?'Yes':'No'?></span></td>
@@ -595,14 +629,27 @@ include __DIR__.'/inc/layout_head.php';
             $ot_out_ts = ts_from_date_and_val($TODAY, $row['ot_out'] ?? null);
 
             if ($row) {
+              // computeDay for OT mins
               $c = $service->computeDay($TODAY,$row);
-              $ot_allowed=!empty($row['ot_allowed']);
-              $todayCompMins = completed_work_mins($TODAY, $row, $WORK_SCHED);
+              $ot_allowed = !empty($row['ot_allowed']);
+              $pairToday = completed_pair_mins($TODAY, $row, $WORK_SCHED);
+              $todayCompMins = (int)$pairToday['total'];
             } else {
               $c = ['regular'=>0,'deduct'=>0,'ot'=>0];
               $ot_allowed=false;
+              $pairToday = ['am'=>0,'pm'=>0,'total'=>0];
               $todayCompMins = 0;
             }
+
+            // Required mins based on completed pairs (half-day aware)
+            if ($pairToday['am'] > 0 && $pairToday['pm'] > 0) {
+              $requiredToday = $REG_DAILY_MINS;            // 8h
+            } elseif ($pairToday['am'] > 0 || $pairToday['pm'] > 0) {
+              $requiredToday = (int)($REG_DAILY_MINS/2);   // 4h
+            } else {
+              $requiredToday = 0;                          // no pair => no missing
+            }
+            $todayDeduct = max(0, $requiredToday - $todayCompMins);
 
             $hasOTpairToday = ($ot_in_ts && $ot_out_ts && $ot_out_ts > $ot_in_ts);
             $todayOT = $hasOTpairToday ? (int)$c['ot'] : 0;
@@ -640,8 +687,8 @@ include __DIR__.'/inc/layout_head.php';
           <td><?= fmt_time_ampm($ot_out_ts) ?></td>
 
           <td class="muted-num group-split"><?= $todayCompMins>0 ? fmt_hhmm_from_mins($todayCompMins) : '' ?></td>
-          <td class="muted-num <?= $c['deduct']>0?'text-danger fw-semibold':'' ?>">
-            <?= fmt_hhmm_from_mins((int)$c['deduct']) ?>
+          <td class="muted-num <?= $todayDeduct>0?'text-danger fw-semibold':'' ?>">
+            <?= fmt_hhmm_from_mins((int)$todayDeduct) ?>
           </td>
           <td class="muted-num"><?= $hasOTpairToday ? fmt_hhmm_from_mins($todayOT) : '' ?></td>
           <td><span class="badge text-bg-<?=$badge?>"><?=$label?></span></td>
@@ -664,7 +711,12 @@ include __DIR__.'/inc/layout_head.php';
 
     <div class="small text-muted mt-2">
       AM Out allowed only until <strong>12:00 PM</strong>. If AM In exists and noon is reached, AM Out is auto-recorded at <strong>12:00 PM</strong>.
-      PM Out allowed until <strong>10:00 PM</strong>. Days with no entries have <strong>no deduction</strong>. OT totals are shown only when both OT In and OT Out exist.
+      PM Out allowed until <strong>10:00 PM</strong>.<br>
+      Regular hours count <strong>only</strong> from completed AM/PM pairs.
+      <strong>Missing</strong> is <strong>0</strong> when there’s <strong>no completed pair</strong>.
+      <strong>Half-day</strong> (one completed pair): Missing = <strong>4:00 − completed</strong>.
+      <strong>Full-day</strong> (two completed pairs): Missing = <strong>8:00 − completed</strong>.
+      OT totals are shown only when both OT In and OT Out exist.
     </div>
   </div>
 </div>
