@@ -2,7 +2,7 @@
 // ======================================================================
 // /admin/payroll.php — Payroll (Monthly) with Half-day Credits & Safe Deductions
 //
-// EXACT RULES (per your request):
+// EXACT RULES:
 //  • If only AM is complete → credit AM only (4h). Vice-versa for PM.
 //  • Deduct only for a half (AM/PM) that is fully absent (no IN and no OUT).
 //  • If there is a TIME IN but NO TIME OUT → DO NOT deduct.
@@ -10,8 +10,6 @@
 //  • Daily rate is pro-rated over FIXED 8 hours (480 minutes).
 //  • OT is from OT IN/OUT, counted only beyond 8h and only if allowed.
 //  • Modal z-index bumped so it won’t overlap with sidebar/header.
-//
-// Plug into your current admin template (includes, header/footer).
 // ======================================================================
 require_once __DIR__.'/inc/common.php';
 @date_default_timezone_set('Asia/Manila');
@@ -372,8 +370,6 @@ include __DIR__.'/inc/layout_head.php';
   .payroll-table thead th { white-space: nowrap; }
   .form-label.small { margin-bottom: .15rem; }
   @media print { .no-print { display:none !important; } }
-
-  /* Keep modals above sidebar/header; prevent underlying scroll jump */
   :root{ --pm-z-backdrop: 2040; --pm-z-modal: 2050; }
   .modal-backdrop{ z-index: var(--pm-z-backdrop) !important; }
   .modal{ z-index: var(--pm-z-modal) !important; }
@@ -596,7 +592,6 @@ include __DIR__.'/inc/layout_head.php';
 
 <script>
 (function(){
-  // Convert "HH:MM[:SS]" or "YYYY-MM-DD HH:MM[:SS]" to 12-hour with AM/PM
   function to12(t){
     if(!t) return '';
     let m = String(t).match(/(\d{1,2}):(\d{2})(?::\d{2})?/);
@@ -657,7 +652,7 @@ include __DIR__.'/inc/layout_head.php';
         <td class="no-print d-flex flex-wrap gap-1">
           <button type="button" class="btn btn-sm ${paid?'btn-outline-danger':'btn-success'} dm-mark-paid"
                   data-date="${row.date}" data-emp="${empId}" data-action="${paid?'unmark':'mark'}">
-            ${paid ? '<i class="fa fa-undo me-1"></i>Unmark Paid' : '<i class="fa fa-check me-1"></i>Mark Paid'}
+            ${paid ? '<i class="fa fa-undo me-1"></i>Unmark Paid' : '<i class="fa fa-check me-1"></i>Mark Paid' }
           </button>
           <button type="button" class="btn btn-sm ${ot?'btn-outline-warning':'btn-outline-primary'} dm-mark-ot"
                   data-date="${row.date}" data-emp="${empId}" data-action="${ot?'unmark':'mark'}">
