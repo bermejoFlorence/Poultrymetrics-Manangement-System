@@ -1,6 +1,10 @@
 <?php
+
+
 // /admin/admin_dashboard.php
 declare(strict_types=1);
+
+
 
 if (session_status() !== PHP_SESSION_ACTIVE) session_start();
 
@@ -11,6 +15,10 @@ if (empty($_SESSION['user_id']) || strtolower((string)($_SESSION['role'] ?? ''))
   header('Location: ' . $loginRel);
   exit;
 }
+
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
+error_reporting(E_ALL);
 
 /* Layout head pulls common + header/sidebar and sets $conn, helpers, etc. */
 include __DIR__ . '/inc/layout_head.php';
