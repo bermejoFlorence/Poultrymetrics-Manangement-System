@@ -11,6 +11,11 @@ if (isset($conn) && $conn instanceof mysqli) {
   @$conn->query("SET time_zone = '+08:00'");
   @$conn->set_charset('utf8mb4');
 }
+
+// DEV ONLY: show errors on screen
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
+error_reporting(E_ALL);
 mysqli_report(MYSQLI_REPORT_OFF);
 
 if (!function_exists('h')) { function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); } }
