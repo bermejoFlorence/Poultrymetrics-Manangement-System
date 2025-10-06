@@ -8,13 +8,6 @@ if ($PM_ROOT && is_file($PM_ROOT.'/config.php')) {
   require_once $PM_ROOT.'/config.php';
 }
 
-/* Safe DB defaults */
-if (!defined('DB_HOST')) define('DB_HOST', '127.0.0.1');
-if (!defined('DB_USER')) define('DB_USER', 'root');
-if (!defined('DB_PASS')) define('DB_PASS', '');
-if (!defined('DB_NAME')) define('DB_NAME', 'poultrymetrics');
-if (!defined('DB_PORT')) define('DB_PORT', 3306);
-
 /* Base helpers */
 if (!function_exists('pm_detect_base_uri')) {
   function pm_detect_base_uri(): string {
