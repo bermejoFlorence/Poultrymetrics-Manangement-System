@@ -1,58 +1,91 @@
 <?php
-// /admin/customer_orders.php — Admin side Orders with Approve + Mark Done actions
+// /admin/customer_orders.php — Admin side Orders with Approve + Mark Done actions (robust table/column discovery)
 declare(strict_types=1);
 
 $PAGE_TITLE = 'Customer Orders';
 $CURRENT    = 'customer_orders.php';
 require_once __DIR__ . '/layout_head.php'; // includes admin guard, $conn, helpers
 
-if (!function_exists('peso')) {
-  function peso($n){ return '₱' . number_format((float)$n, 2); }
+@date_default_timezone_set('Asia/Manila');
+if (isset($conn) && $conn instanceof mysqli) {
+  @$conn->query("SET time_zone = '+08:00'");
+  @$conn->set_charset('utf8mb4');
 }
-if (!function_exists('firstCol')) {
-  function firstCol(mysqli $c, string $tbl, array $cands){
-    foreach ($cands as $col) if (function_exists('colExists') && colExists($c,$tbl,$col)) return $col;
-    return null;
+mysqli_report(MYSQLI_REPORT_OFF);
+
+if (!function_exists('h')) { function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); } }
+if (!function_exists('peso')) { function peso($n){ return '₱' . number_format((float)$n, 2); } }
+
+/* ---------- Strict helpers using INFORMATION_SCHEMA ---------- */
+function tbl_exists(mysqli $c, string $t): bool {
+  $sql = "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? LIMIT 1";
+  if (!$st=$c->prepare($sql)) return false;
+  $st->bind_param('s',$t); $st->execute(); $st->store_result();
+  $ok = $st->num_rows>0; $st->close(); return $ok;
+}
+function col_exists(mysqli $c, string $t, string $col): bool {
+  $sql = "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1";
+  if (!$st=$c->prepare($sql)) return false;
+  $st->bind_param('ss',$t,$col); $st->execute(); $st->store_result();
+  $ok = $st->num_rows>0; $st->close(); return $ok;
+}
+function first_col(mysqli $c, string $t, array $cands): ?string {
+  foreach ($cands as $x) if ($x && col_exists($c,$t,$x)) return $x;
+  return null;
+}
+function find_orders_table(mysqli $c): ?string {
+  foreach (['customer_orders','orders','customer_order','pmx_customer_orders'] as $t) {
+    if (tbl_exists($c,$t)) return $t;
   }
+  // last chance: best-looking table
+  $sql = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND (TABLE_NAME LIKE '%customer%order%' OR TABLE_NAME LIKE '%orders%')
+          ORDER BY TABLE_NAME LIMIT 1";
+  if ($r=$c->query($sql)) { $row=$r->fetch_row(); if ($row && $row[0]) return $row[0]; }
+  return null;
 }
 
-/* ---------- Schema discovery ---------- */
-$haveOrders = ($conn instanceof mysqli) && function_exists('tableExists') && tableExists($conn,'customer_orders');
-if (!$haveOrders) {
-  echo '<div class="container"><div class="alert alert-warning mt-3">Table <code>customer_orders</code> not found. Create it to use this page.</div></div></main></body></html>';
-  exit;
+/* ---------- Find the orders table (like your dashboard does) ---------- */
+$T = find_orders_table($conn);
+if (!$T) {
+  $db = ''; if ($r=$conn->query("SELECT DATABASE()")) { $db=(string)($r->fetch_row()[0]??''); }
+  echo '<div class="container"><div class="alert alert-warning mt-3">';
+  echo 'Orders table not found in current database: <code>'.h($db).'</code>. ';
+  echo 'Expected something like <code>customer_orders</code> or <code>orders</code>.';
+  echo '</div></div></main></body></html>'; exit;
 }
 
-$T       = 'customer_orders';
-$PK      = firstCol($conn,$T,['id','order_id','customer_order_id']);
-$CUST    = firstCol($conn,$T,['customer_name','client_name','name']);
-$CUST_ID = firstCol($conn,$T,['customer_id','client_id','user_id']);
-$EMAIL   = firstCol($conn,$T,['email','customer_email']);
-$DATEC   = firstCol($conn,$T,['order_date','created_at','date','placed_at']);
-$STATUS  = firstCol($conn,$T,['status','order_status']);
-$PAYSTAT = firstCol($conn,$T,['payment_status','pay_status']);
-$TOTAL   = firstCol($conn,$T,['grand_total','total_amount','total','amount']);
+/* ---------- Column discovery (aligns with accountant dashboard mapping) ---------- */
+$PK      = first_col($conn,$T, ['id','order_id','customer_order_id','oid']);
+$CUST    = first_col($conn,$T, ['customer_name','deliver_to','recipient','client_name','name','ship_to']);
+$CUST_ID = first_col($conn,$T, ['customer_id','user_id','uid','account_id','users_id','client_id']);
+$EMAIL   = first_col($conn,$T, ['email','customer_email']);
+$DATEC   = first_col($conn,$T, ['created_at','created','order_date','date_added','placed_at','date']);
+$STATUS  = first_col($conn,$T, ['status','state','order_status']);
+$PAYSTAT = first_col($conn,$T, ['payment_status','pay_status']);
+$TOTAL   = first_col($conn,$T, ['grand_total','total','amount','total_amount']);
 
 if (!$PK) {
-  echo '<div class="container"><div class="alert alert-danger mt-3">Primary key column not found (expected one of: id, order_id, customer_order_id).</div></div></main></body></html>';
+  echo '<div class="container"><div class="alert alert-danger mt-3">Primary key column not found on <code>'.h($T).'</code> (tried: id, order_id, customer_order_id).</div></div></main></body></html>';
   exit;
 }
 
 /* ---------- Status vocabulary (auto-learn) ---------- */
 $knownStatuses = [];
 if ($STATUS) {
-  if ($st = $conn->prepare("SELECT DISTINCT LOWER($STATUS) FROM $T WHERE $STATUS IS NOT NULL AND $STATUS<>'' LIMIT 50")){
+  if ($st=$conn->prepare("SELECT DISTINCT LOWER(`$STATUS`) FROM `$T` WHERE `$STATUS` IS NOT NULL AND `$STATUS`<>'' LIMIT 50")){
     $st->execute(); $res=$st->get_result();
-    while($r=$res->fetch_row()){ $knownStatuses[] = $r[0]; }
+    while($r=$res->fetch_row()){ $knownStatuses[]=$r[0]; }
     $st->close();
   }
 }
-$choose = function(array $cands, string $fallback) use ($knownStatuses){
-  foreach ($cands as $s) if (in_array($s, $knownStatuses, true)) return $s;
+$pickStatus = function(array $cands, string $fallback) use ($knownStatuses){
+  foreach ($cands as $s) if (in_array($s,$knownStatuses,true)) return $s;
   return $fallback;
 };
-$labelApproved  = $choose(['approved','processing','confirmed'], 'approved');
-$labelCompleted = $choose(['completed','complete','done','fulfilled','closed'], 'completed');
+$labelApproved  = $pickStatus(['approved','processing','confirmed','accepted'], 'approved');
+$labelCompleted = $pickStatus(['completed','complete','done','fulfilled','delivered','closed'], 'completed');
 
 /* ---------- Filters ---------- */
 $from = isset($_GET['from']) ? substr($_GET['from'],0,10) : date('Y-m-01');
@@ -66,16 +99,16 @@ if (($DATEC && $PK) && isset($_GET['export']) && $_GET['export']==='csv') {
   $out = fopen('php://output','w');
   fputcsv($out, ['Order #','Date','Customer','Email','Status','Payment','Total']);
 
-  $where = "WHERE ".($DATEC ? "DATE($DATEC) BETWEEN ? AND ?" : "1");
+  $where = "WHERE ".($DATEC ? "DATE(`$DATEC`) BETWEEN ? AND ?" : "1");
   $params=[]; $types='';
   if ($DATEC){ $params=[$from,$to]; $types='ss'; }
-  if ($stf !== '' && $STATUS){ $where .= " AND $STATUS=?"; $params[]=$stf; $types.='s'; }
+  if ($stf !== '' && $STATUS){ $where .= " AND `$STATUS`=?"; $params[]=$stf; $types.='s'; }
 
-  $cols = "$PK".($DATEC?",$DATEC":"")
-        .($CUST?",$CUST":"").($EMAIL?",$EMAIL":"")
-        .($STATUS?",$STATUS":"").($PAYSTAT?",$PAYSTAT":"")
-        .($TOTAL?",$TOTAL":"");
-  $sql = "SELECT $cols FROM $T $where ORDER BY ".($DATEC?$DATEC:'1')." DESC, $PK DESC";
+  $cols = "`$PK`".($DATEC?",`$DATEC`":"")
+        .($CUST?",`$CUST`":"").($EMAIL?",`$EMAIL`":"")
+        .($STATUS?",`$STATUS`":"").($PAYSTAT?",`$PAYSTAT`":"")
+        .($TOTAL?",`$TOTAL`":"");
+  $sql = "SELECT $cols FROM `$T` $where ORDER BY ".($DATEC?"`$DATEC`":'1')." DESC, `$PK` DESC";
   $stmt = $conn->prepare($sql);
   if ($params) $stmt->bind_param($types, ...$params);
   $stmt->execute(); $res=$stmt->get_result();
@@ -101,7 +134,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action'])) {
 
   // Mark Paid
   if ($_POST['action']==='mark_paid' && $PAYSTAT) {
-    $sql = "UPDATE $T SET $PAYSTAT='paid' WHERE $PK=?";
+    $sql = "UPDATE `$T` SET `$PAYSTAT`='paid' WHERE `$PK`=?";
     $st = $conn->prepare($sql); $st->bind_param('i',$id); $ok=$st->execute(); $st->close();
     echo json_encode(['ok'=>$ok]); exit;
   }
@@ -109,7 +142,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action'])) {
   // Approve
   if ($_POST['action']==='approve' && $STATUS) {
     $val = $labelApproved;
-    $sql = "UPDATE $T SET $STATUS=? WHERE $PK=?";
+    $sql = "UPDATE `$T` SET `$STATUS`=? WHERE `$PK`=?";
     $st = $conn->prepare($sql); $st->bind_param('si',$val,$id); $ok=$st->execute(); $st->close();
     echo json_encode(['ok'=>$ok]); exit;
   }
@@ -117,7 +150,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action'])) {
   // Mark Done (Completed)
   if ($_POST['action']==='mark_done' && $STATUS) {
     $val = $labelCompleted;
-    $sql = "UPDATE $T SET $STATUS=? WHERE $PK=?";
+    $sql = "UPDATE `$T` SET `$STATUS`=? WHERE `$PK`=?";
     $st = $conn->prepare($sql); $st->bind_param('si',$val,$id); $ok=$st->execute(); $st->close();
     echo json_encode(['ok'=>$ok]); exit;
   }
@@ -125,22 +158,29 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action'])) {
   // Explicit Set Status (dropdown)
   if ($_POST['action']==='set_status' && $STATUS) {
     $new = substr((string)($_POST['status']??''),0,32);
-    $sql = "UPDATE $T SET $STATUS=? WHERE $PK=?";
+    $sql = "UPDATE `$T` SET `$STATUS`=? WHERE `$PK`=?";
     $st = $conn->prepare($sql); $st->bind_param('si',$new,$id); $ok=$st->execute(); $st->close();
     echo json_encode(['ok'=>$ok]); exit;
   }
 
-  // View items
+  // View items (supports several item table names/columns)
   if ($_POST['action']==='view') {
-    $itemsTbl = tableExists($conn,'order_items') ? 'order_items' : (tableExists($conn,'customer_order_items') ? 'customer_order_items' : null);
+    $itemsTbl = null;
+    foreach (['customer_order_items','order_items','orders_items','order_detail'] as $cand) {
+      if (tbl_exists($conn, $cand)) { $itemsTbl = $cand; break; }
+    }
     $rows = [];
     if ($itemsTbl){
-      $fk    = firstCol($conn,$itemsTbl,['order_id','customer_order_id',$PK]);
-      $qty   = firstCol($conn,$itemsTbl,['qty','quantity']);
-      $price = firstCol($conn,$itemsTbl,['unit_price','price']);
-      $name  = firstCol($conn,$itemsTbl,['product_name','item_name','name']);
+      $fk    = first_col($conn,$itemsTbl, ['customer_order_id','order_id',$PK]);
+      $qty   = first_col($conn,$itemsTbl, ['qty','quantity','qty_ordered']);
+      $price = first_col($conn,$itemsTbl, ['unit_price','price','unit_cost']);
+      $name  = first_col($conn,$itemsTbl, ['product_name','item_name','name','title']);
       if ($fk){
-        $sql="SELECT ".($name?$name.' AS item_name,':'').($qty?$qty.' AS qty,':'').($price?$price.' AS unit_price':'1 AS unit_price')." FROM $itemsTbl WHERE $fk=?";
+        $sel = [];
+        $sel[] = $name ? "`$name` AS item_name" : "'(item)' AS item_name";
+        $sel[] = $qty   ? "`$qty` AS qty"       : "1 AS qty";
+        $sel[] = $price ? "`$price` AS unit_price" : "0 AS unit_price";
+        $sql="SELECT ".implode(',', $sel)." FROM `$itemsTbl` WHERE `$fk`=?";
         $st = $conn->prepare($sql); $st->bind_param('i',$id); $st->execute();
         $r=$st->get_result();
         while($x=$r->fetch_assoc()){ $rows[]=$x; }
@@ -156,7 +196,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['action'])) {
 /* ---------- Distinct statuses for filter ---------- */
 $statuses = [];
 if ($STATUS) {
-  if ($stmt=$conn->prepare("SELECT DISTINCT $STATUS FROM $T WHERE $STATUS IS NOT NULL AND $STATUS<>'' ORDER BY 1")){
+  if ($stmt=$conn->prepare("SELECT DISTINCT `$STATUS` FROM `$T` WHERE `$STATUS` IS NOT NULL AND `$STATUS`<>'' ORDER BY 1")){
     $stmt->execute(); $res=$stmt->get_result();
     while($r=$res->fetch_row()){ $statuses[]=$r[0]; }
     $stmt->close();
@@ -164,20 +204,20 @@ if ($STATUS) {
 }
 
 /* ---------- Fetch list ---------- */
-$where = $DATEC ? "WHERE DATE($DATEC) BETWEEN ? AND ?" : "WHERE 1";
+$where = $DATEC ? "WHERE DATE(`$DATEC`) BETWEEN ? AND ?" : "WHERE 1";
 $params=[]; $types='';
 if ($DATEC){ $params=[$from,$to]; $types='ss'; }
-if ($stf !== '' && $STATUS){ $where .= " AND $STATUS=?"; $params[]=$stf; $types.='s'; }
+if ($stf !== '' && $STATUS){ $where .= " AND `$STATUS`=?"; $params[]=$stf; $types.='s'; }
 
-$cols = "$PK"
-      .($DATEC?",$DATEC":"")
-      .($CUST?",$CUST":"")
-      .($CUST_ID?",$CUST_ID":"")
-      .($EMAIL?",$EMAIL":"")
-      .($STATUS?",$STATUS":"")
-      .($PAYSTAT?",$PAYSTAT":"")
-      .($TOTAL?",$TOTAL":"");
-$sql = "SELECT $cols FROM $T $where ORDER BY ".($DATEC?$DATEC:'1')." DESC, $PK DESC";
+$cols = "`$PK`"
+      .($DATEC? ",`$DATEC`" : "")
+      .($CUST?  ",`$CUST`"  : "")
+      .($CUST_ID?",`$CUST_ID`":"")
+      .($EMAIL? ",`$EMAIL`" : "")
+      .($STATUS?",`$STATUS`":"")
+      .($PAYSTAT?",`$PAYSTAT`":"")
+      .($TOTAL? ",`$TOTAL`" : "");
+$sql = "SELECT $cols FROM `$T` $where ORDER BY ".($DATEC?"`$DATEC`":'1')." DESC, `$PK` DESC";
 $stmt = $conn->prepare($sql);
 if ($params) $stmt->bind_param($types, ...$params);
 $stmt->execute(); $list = $stmt->get_result();
@@ -185,13 +225,13 @@ $stmt->execute(); $list = $stmt->get_result();
 /* ---------- Totals ---------- */
 $sumTotal = 0.0; $countOrders = 0;
 if ($TOTAL) {
-  $sumSQL = "SELECT COALESCE(SUM($TOTAL),0) FROM $T $where";
+  $sumSQL = "SELECT COALESCE(SUM(`$TOTAL`),0) FROM `$T` $where";
   $stm2 = $conn->prepare($sumSQL);
   if ($params) $stm2->bind_param($types, ...$params);
   $stm2->execute(); $sumTotal = (float)($stm2->get_result()->fetch_row()[0] ?? 0); $stm2->close();
 }
-if ($PK) {
-  $cntSQL = "SELECT COUNT(*) FROM $T $where";
+{
+  $cntSQL = "SELECT COUNT(*) FROM `$T` $where";
   $stm3 = $conn->prepare($cntSQL);
   if ($params) $stm3->bind_param($types, ...$params);
   $stm3->execute(); $countOrders = (int)($stm3->get_result()->fetch_row()[0] ?? 0); $stm3->close();
@@ -219,7 +259,9 @@ if ($PK) {
       </div>
       <div class="col-auto">
         <button class="btn btn-sm btn-primary mt-3"><i class="fa-solid fa-filter"></i> Apply</button>
+        <?php if ($DATEC): ?>
         <a class="btn btn-sm btn-outline-secondary mt-3" href="?from=<?php echo h($from); ?>&to=<?php echo h($to); ?>&status=<?php echo h($stf); ?>&export=csv"><i class="fa-solid fa-file-csv"></i> CSV</a>
+        <?php endif; ?>
       </div>
     </form>
     <div class="ms-auto d-flex gap-2">
@@ -231,6 +273,7 @@ if ($PK) {
   <div class="card">
     <div class="card-header d-flex align-items-center justify-content-between">
       <strong>Customer Orders</strong>
+      <span class="text-muted small">(<?php echo h($T); ?>)</span>
     </div>
     <div class="table-responsive">
       <table class="table table-sm align-middle mb-0">
@@ -250,14 +293,13 @@ if ($PK) {
           <?php while($row=$list->fetch_assoc()): ?>
             <?php
               $s = $STATUS ? strtolower((string)($row[$STATUS] ?? '')) : '';
-              $isApproved  = $s === $labelApproved;
-              $isCompleted = in_array($s, [$labelCompleted,'completed','complete','done','fulfilled','closed'], true);
+              $isApproved  = $s === $labelApproved || in_array($s,['approved','processing','confirmed','accepted'],true);
+              $isCompleted = in_array($s, [$labelCompleted,'completed','complete','done','fulfilled','delivered','closed'], true);
               $cls = match($s){
-                'pending' => 'warning',
-                'processing' => 'info',
-                'approved' => 'primary',
-                'completed','complete','done','fulfilled','closed' => 'success',
-                'cancelled','canceled' => 'secondary',
+                'pending','placed','created','new','awaiting' => 'warning',
+                'processing','approved','confirmed','accepted' => 'info',
+                'completed','complete','done','fulfilled','delivered','closed' => 'success',
+                'cancelled','canceled','void','rejected','failed' => 'secondary',
                 default => 'light'
               };
               $p = $PAYSTAT ? strtolower((string)($row[$PAYSTAT] ?? '')) : '';
@@ -265,19 +307,19 @@ if ($PK) {
             ?>
             <tr>
               <td class="text-muted"><?php echo h($row[$PK]); ?></td>
-              <?php if ($DATEC): ?><td><?php echo h(date('M d, Y', strtotime($row[$DATEC]))); ?></td><?php endif; ?>
-              <td><?php echo h($CUST && !empty($row[$CUST]) ? $row[$CUST] : ($CUST_ID && !empty($row[$CUST_ID]) ? 'ID#'.$row[$CUST_ID] : '—')); ?></td>
+              <?php if ($DATEC): ?><td><?php echo h(!empty($row[$DATEC]) ? date('M d, Y', strtotime($row[$DATEC])) : '—'); ?></td><?php endif; ?>
+              <td><?php
+                  $cust = $CUST && !empty($row[$CUST]) ? $row[$CUST] : ($CUST_ID && !empty($row[$CUST_ID]) ? 'ID#'.$row[$CUST_ID] : '—');
+                  echo h($cust);
+              ?></td>
               <?php if ($EMAIL): ?><td><?php echo h($row[$EMAIL] ?: '—'); ?></td><?php endif; ?>
               <?php if ($STATUS): ?><td><span class="badge text-bg-<?php echo $cls; ?>"><?php echo h(ucfirst($s?:'n/a')); ?></span></td><?php endif; ?>
               <?php if ($PAYSTAT): ?><td><span class="badge text-bg-<?php echo $pcls; ?>"><?php echo h(ucfirst($p?:'n/a')); ?></span></td><?php endif; ?>
-              <?php if ($TOTAL): ?><td class="text-end fw-semibold"><?php echo peso($row[$TOTAL]); ?></td><?php endif; ?>
+              <?php if ($TOTAL): ?><td class="text-end fw-semibold"><?php echo peso($row[$TOTAL] ?? 0); ?></td><?php endif; ?>
               <td class="d-flex flex-wrap gap-1">
-                
-
                 <?php if ($PAYSTAT && $p!=='paid'): ?>
                   <button class="btn btn-sm btn-outline-success" title="Mark Paid" onclick="markPaid(<?php echo (int)$row[$PK]; ?>)"><i class="fa-solid fa-peso-sign"></i></button>
                 <?php endif; ?>
-
                 <?php if ($STATUS): ?>
                   <?php if (!$isApproved && !$isCompleted): ?>
                     <button class="btn btn-sm btn-outline-primary" title="Approve" onclick="approveOrder(<?php echo (int)$row[$PK]; ?>)"><i class="fa-solid fa-check"></i></button>
@@ -285,9 +327,8 @@ if ($PK) {
                   <?php if (!$isCompleted): ?>
                     <button class="btn btn-sm btn-outline-success" title="Mark Done" onclick="markDone(<?php echo (int)$row[$PK]; ?>)"><i class="fa-solid fa-circle-check"></i></button>
                   <?php endif; ?>
-
-                  
                 <?php endif; ?>
+                <button class="btn btn-sm btn-outline-secondary" title="View Items" onclick="viewOrder(<?php echo (int)$row[$PK]; ?>)"><i class="fa-solid fa-list"></i></button>
               </td>
             </tr>
           <?php endwhile; ?>
@@ -343,7 +384,7 @@ function viewOrder(id){
       let html = '<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Item</th><th class="text-end">Qty</th><th class="text-end">Unit</th><th class="text-end">Line</th></tr></thead><tbody>';
       res.items.forEach(x=>{
         const name = x.item_name ?? '(item)';
-        const qty = Number(x.qty ?? 1);
+        const qty  = Number(x.qty ?? 1);
         const unit = Number(x.unit_price ?? 0);
         html += `<tr><td>${name}</td><td class="text-end">${qty}</td><td class="text-end">₱${unit.toFixed(2)}</td><td class="text-end">₱${(qty*unit).toFixed(2)}</td></tr>`;
       });
