@@ -1,10 +1,12 @@
 <?php
 // ======================================================================
-// admin/attendance.php — Tight & Responsive DTR (Today + Monthly)
+// admin/attendance.php — DTR (Today + Monthly) with Manual Edit
 // - Kiosk: capture (fp_grab.php) → identify (fp_identify.php) → punch
 // - Identification order: biometric_id (if typed) → hash match → CLI matcher
 // - Falls back to selected NAME if identification fails
-// - AM/PM/OT In/Out sequence with clamping
+// - AM/PM/OT In/Out sequence with clamping (punch flow)
+// - Manual edit forms per row (Today & Monthly); accepts HH:MM / HH:MM:SS / h:m AM/PM
+// - Half-day rule for "Missing": 0 if no pair; 4h if one pair; 8h if two pairs; Missing = max(0, required − completed_pairs)
 // - Requires: admin/inc/common.php, admin/inc/AttendanceService.php
 // ======================================================================
 
@@ -100,6 +102,30 @@ function completed_pair_mins(string $date, array $row, array $sched): array {
   $pm = ($pi && $po && $po > $pi) ? dtr_overlap_mins($pi,$po,$spm,$epm) : 0;
 
   return ['am'=>$am, 'pm'=>$pm, 'total'=>$am+$pm];
+}
+
+/* Accepts "", "HH:MM", "HH:MM:SS", or "h:m AM/PM" → returns "HH:MM:SS" or null */
+function normalize_time_or_null(?string $v): ?string {
+  $v = trim((string)$v);
+  if ($v === '') return null;
+  // 12h → 24h
+  if (preg_match('/^\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)$/i', $v)) {
+    $t = date('H:i:s', strtotime($v));
+    return $t ?: null;
+  }
+  // 24h short
+  if (preg_match('/^\d{1,2}:\d{2}$/', $v)) {
+    [$h,$m] = explode(':',$v,2);
+    $h = (int)$h; $m=(int)$m;
+    if ($h>=0 && $h<=23 && $m>=0 && $m<=59) return sprintf('%02d:%02d:00',$h,$m);
+  }
+  // 24h long
+  if (preg_match('/^\d{1,2}:\d{2}:\d{2}$/', $v)) {
+    [$h,$m,$s] = explode(':',$v,3);
+    $h=(int)$h; $m=(int)$m; $s=(int)$s;
+    if ($h>=0 && $h<=23 && $m>=0 && $m<=59 && $s>=0 && $s<=59) return sprintf('%02d:%02d:%02d',$h,$m,$s);
+  }
+  return null;
 }
 
 /* ---------------- Page config ---------------- */
@@ -235,6 +261,59 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       'time'=>$now,
       'message'=>sprintf('%s — %s @ %s',$nm,$dec['label'],date('g:i A', strtotime("$TODAY $now")))
     ]); exit;
+  }
+
+  // ===== Save manual times (AM/PM/OT) =====
+  if (($_POST['action'] ?? '') === 'save_times') {
+    if (!hash_equals(csrf_token(), (string)($_POST['csrf'] ?? ''))) {
+      http_response_code(400); die('Bad CSRF');
+    }
+    $eid  = (int)($_POST['employee_id'] ?? 0);
+    $date = trim((string)($_POST['work_date'] ?? ''));
+    if ($eid<=0 || !preg_match('/^\d{4}-\d{2}-\d{2}$/',$date)) { http_response_code(400); die('Invalid params'); }
+
+    // Normalize inputs ('' => NULL)
+    $am_in  = normalize_time_or_null($_POST['am_in']  ?? '');
+    $am_out = normalize_time_or_null($_POST['am_out'] ?? '');
+    $pm_in  = normalize_time_or_null($_POST['pm_in']  ?? '');
+    $pm_out = normalize_time_or_null($_POST['pm_out'] ?? '');
+    $ot_in  = normalize_time_or_null($_POST['ot_in']  ?? '');
+    $ot_out = normalize_time_or_null($_POST['ot_out'] ?? '');
+
+    // Ensure row exists
+    ensure_att_row($conn, $eid, $date);
+
+    // Build dynamic update with NULL support
+    $cols = ['am_in'=>$am_in,'am_out'=>$am_out,'pm_in'=>$pm_in,'pm_out'=>$pm_out,'ot_in'=>$ot_in,'ot_out'=>$ot_out];
+    $sets = []; $types=''; $vals=[];
+    foreach($cols as $col=>$val){
+      if ($val === null) {
+        $sets[] = "`$col`=NULL";
+      } else {
+        $sets[] = "`$col`=?";
+        $types .= 's';
+        $vals[] = $val;
+      }
+    }
+    $sql = "UPDATE attendance SET ".implode(',', $sets)." WHERE employee_id=? AND work_date=?";
+    $st  = $conn->prepare($sql);
+    if ($types !== '') {
+      $types .= 'is';
+      $vals[] = $eid; $vals[] = $date;
+      $st->bind_param($types, ...$vals);
+    } else {
+      // nothing to bind for times, just employee/date
+      $st->bind_param('is', $eid, $date);
+    }
+    $st->execute(); $st->close();
+
+    // Redirect back to preserve filters
+    $redir = 'attendance.php';
+    if (isset($_POST['from']) && $_POST['from'] === 'monthly') {
+      $m = (int)($_POST['month'] ?? date('n')); $y = (int)($_POST['year'] ?? date('Y')); $emp = (int)$eid;
+      $redir .= "?m={$m}&emp={$emp}";
+    }
+    header("Location: {$redir}"); exit;
   }
 
   // ===== Existing button actions (OT & pay toggles) =====
@@ -555,16 +634,77 @@ include __DIR__.'/inc/layout_head.php';
                 <td class="muted-num"><?= $hasOTpair ? fmt_hhmm_from_mins($dayOT) : '' ?></td>
                 <td><span class="badge text-bg-<?=$paidFlag?'success':'secondary'?>"><?=$paidFlag?'Yes':'No'?></span></td>
                 <td>
-                  <form method="post" class="d-inline">
-                    <input type="hidden" name="csrf" value="<?=h(csrf_token())?>">
-                    <input type="hidden" name="action" value="toggle_paid_day">
-                    <input type="hidden" name="employee_id" value="<?= (int)$empFilter ?>">
-                    <input type="hidden" name="work_date" value="<?= h($date) ?>">
-                    <input type="hidden" name="to" value="<?= $paidFlag?0:1 ?>">
-                    <button class="btn btn-sm btn-outline-<?=$paidFlag?'danger':'success'?>">
-                      <?=$paidFlag ? 'Unpaid' : 'Mark Paid'?>
+                  <div class="d-flex gap-2 align-items-center">
+                    <form method="post" class="d-inline">
+                      <input type="hidden" name="csrf" value="<?=h(csrf_token())?>">
+                      <input type="hidden" name="action" value="toggle_paid_day">
+                      <input type="hidden" name="employee_id" value="<?= (int)$empFilter ?>">
+                      <input type="hidden" name="work_date" value="<?= h($date) ?>">
+                      <input type="hidden" name="to" value="<?= $paidFlag?0:1 ?>">
+                      <button class="btn btn-sm btn-outline-<?=$paidFlag?'danger':'success'?>">
+                        <?=$paidFlag ? 'Unpaid' : 'Mark Paid'?>
+                      </button>
+                    </form>
+
+                    <button class="btn btn-sm btn-outline-secondary"
+                            type="button"
+                            data-bs-toggle="collapse"
+                            data-bs-target="#editRow<?=$empFilter?>_<?=str_replace('-','',$date)?>">
+                      <i class="fa fa-pen"></i>
                     </button>
-                  </form>
+                  </div>
+
+                  <!-- Inline edit form (collapse) -->
+                  <div class="collapse mt-2" id="editRow<?=$empFilter?>_<?=str_replace('-','',$date)?>">
+                    <form method="post" class="border rounded p-2 bg-light-subtle">
+                      <input type="hidden" name="csrf" value="<?=h(csrf_token())?>">
+                      <input type="hidden" name="action" value="save_times">
+                      <input type="hidden" name="employee_id" value="<?= (int)$empFilter ?>">
+                      <input type="hidden" name="work_date" value="<?= h($date) ?>">
+                      <input type="hidden" name="from" value="monthly">
+                      <input type="hidden" name="month" value="<?= (int)$month ?>">
+                      <input type="hidden" name="year" value="<?= (int)$THIS_YEAR ?>">
+
+                      <div class="row g-1 align-items-end">
+                        <div class="col-6 col-md-3">
+                          <label class="form-label small">AM In</label>
+                          <input name="am_in" class="form-control form-control-sm" placeholder="HH:MM"
+                                 value="<?= h($x['am_in'] ?? '') ?>">
+                        </div>
+                        <div class="col-6 col-md-3">
+                          <label class="form-label small">AM Out</label>
+                          <input name="am_out" class="form-control form-control-sm" placeholder="HH:MM"
+                                 value="<?= h($x['am_out'] ?? '') ?>">
+                        </div>
+                        <div class="col-6 col-md-3">
+                          <label class="form-label small">PM In</label>
+                          <input name="pm_in" class="form-control form-control-sm" placeholder="HH:MM"
+                                 value="<?= h($x['pm_in'] ?? '') ?>">
+                        </div>
+                        <div class="col-6 col-md-3">
+                          <label class="form-label small">PM Out</label>
+                          <input name="pm_out" class="form-control form-control-sm" placeholder="HH:MM"
+                                 value="<?= h($x['pm_out'] ?? '') ?>">
+                        </div>
+                        <div class="col-6 col-md-3">
+                          <label class="form-label small">OT In</label>
+                          <input name="ot_in" class="form-control form-control-sm" placeholder="HH:MM"
+                                 value="<?= h($x['ot_in'] ?? '') ?>">
+                        </div>
+                        <div class="col-6 col-md-3">
+                          <label class="form-label small">OT Out</label>
+                          <input name="ot_out" class="form-control form-control-sm" placeholder="HH:MM"
+                                 value="<?= h($x['ot_out'] ?? '') ?>">
+                        </div>
+                        <div class="col-12 col-md-3 mt-2">
+                          <button class="btn btn-sm btn-primary w-100">
+                            <i class="fa fa-save me-1"></i> Save
+                          </button>
+                        </div>
+                      </div>
+                      <div class="small text-muted mt-1">Blank = clear (set to NULL). Accepts HH:MM or HH:MM:SS.</div>
+                    </form>
+                  </div>
                 </td>
               </tr>
               <?php endfor; ?>
@@ -693,16 +833,74 @@ include __DIR__.'/inc/layout_head.php';
           <td class="muted-num"><?= $hasOTpairToday ? fmt_hhmm_from_mins($todayOT) : '' ?></td>
           <td><span class="badge text-bg-<?=$badge?>"><?=$label?></span></td>
           <td>
-            <form method="post" class="d-inline">
-              <input type="hidden" name="csrf" value="<?=h(csrf_token())?>">
-              <input type="hidden" name="action" value="toggle_ot">
-              <input type="hidden" name="employee_id" value="<?= (int)$e['id'] ?>">
-              <input type="hidden" name="work_date" value="<?= h($TODAY) ?>">
-              <input type="hidden" name="to" value="<?= $ot_allowed ? 0 : 1; ?>">
-              <button class="btn btn-sm btn-outline-<?=$ot_allowed?'danger':'success'?>">
-                <?=$ot_allowed ? 'Disable' : 'Allow'?>
+            <div class="d-flex gap-2 align-items-center">
+              <form method="post" class="d-inline">
+                <input type="hidden" name="csrf" value="<?=h(csrf_token())?>">
+                <input type="hidden" name="action" value="toggle_ot">
+                <input type="hidden" name="employee_id" value="<?= (int)$e['id'] ?>">
+                <input type="hidden" name="work_date" value="<?= h($TODAY) ?>">
+                <input type="hidden" name="to" value="<?= $ot_allowed ? 0 : 1; ?>">
+                <button class="btn btn-sm btn-outline-<?=$ot_allowed?'danger':'success'?>">
+                  <?=$ot_allowed ? 'Disable' : 'Allow'?>
+                </button>
+              </form>
+
+              <button class="btn btn-sm btn-outline-secondary"
+                      type="button"
+                      data-bs-toggle="collapse"
+                      data-bs-target="#editToday<?= (int)$e['id'] ?>">
+                <i class="fa fa-pen"></i>
               </button>
-            </form>
+            </div>
+
+            <!-- Inline edit form (collapse) -->
+            <div class="collapse mt-2" id="editToday<?= (int)$e['id'] ?>">
+              <form method="post" class="border rounded p-2 bg-light-subtle">
+                <input type="hidden" name="csrf" value="<?=h(csrf_token())?>">
+                <input type="hidden" name="action" value="save_times">
+                <input type="hidden" name="employee_id" value="<?= (int)$e['id'] ?>">
+                <input type="hidden" name="work_date" value="<?= h($TODAY) ?>">
+
+                <div class="row g-1 align-items-end">
+                  <div class="col-6 col-lg-3">
+                    <label class="form-label small">AM In</label>
+                    <input name="am_in" class="form-control form-control-sm" placeholder="HH:MM"
+                           value="<?= h($row['am_in'] ?? '') ?>">
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <label class="form-label small">AM Out</label>
+                    <input name="am_out" class="form-control form-control-sm" placeholder="HH:MM"
+                           value="<?= h($row['am_out'] ?? '') ?>">
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <label class="form-label small">PM In</label>
+                    <input name="pm_in" class="form-control form-control-sm" placeholder="HH:MM"
+                           value="<?= h($row['pm_in'] ?? '') ?>">
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <label class="form-label small">PM Out</label>
+                    <input name="pm_out" class="form-control form-control-sm" placeholder="HH:MM"
+                           value="<?= h($row['pm_out'] ?? '') ?>">
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <label class="form-label small">OT In</label>
+                    <input name="ot_in" class="form-control form-control-sm" placeholder="HH:MM"
+                           value="<?= h($row['ot_in'] ?? '') ?>">
+                  </div>
+                  <div class="col-6 col-lg-3">
+                    <label class="form-label small">OT Out</label>
+                    <input name="ot_out" class="form-control form-control-sm" placeholder="HH:MM"
+                           value="<?= h($row['ot_out'] ?? '') ?>">
+                  </div>
+                  <div class="col-12 col-lg-3 mt-2">
+                    <button class="btn btn-sm btn-primary w-100">
+                      <i class="fa fa-save me-1"></i> Save
+                    </button>
+                  </div>
+                </div>
+                <div class="small text-muted mt-1">Blank = clear (set to NULL). Accepts HH:MM or HH:MM:SS.</div>
+              </form>
+            </div>
           </td>
         </tr>
         <?php endforeach; endif; ?>
