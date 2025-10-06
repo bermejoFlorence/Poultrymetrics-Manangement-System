@@ -460,9 +460,7 @@ include __DIR__.'/inc/layout_head.php';
             </option>
           <?php endforeach; ?>
         </select>
-        <div class="small text-muted mt-1">
-          Scanner will try to identify automatically. If it fails, you can pick the name here.
-        </div>
+    
       </div>
 
       <div class="col-md-3">
@@ -906,16 +904,6 @@ include __DIR__.'/inc/layout_head.php';
         <?php endforeach; endif; ?>
       </tbody>
     </table>
-
-    <div class="small text-muted mt-2">
-      AM Out allowed only until <strong>12:00 PM</strong>. If AM In exists and noon is reached, AM Out is auto-recorded at <strong>12:00 PM</strong>.
-      PM Out allowed until <strong>10:00 PM</strong>.<br>
-      Regular hours count <strong>only</strong> from completed AM/PM pairs.
-      <strong>Missing</strong> is <strong>0</strong> when there’s <strong>no completed pair</strong>.
-      <strong>Half-day</strong> (one completed pair): Missing = <strong>4:00 − completed</strong>.
-      <strong>Full-day</strong> (two completed pairs): Missing = <strong>8:00 − completed</strong>.
-      OT totals are shown only when both OT In and OT Out exist.
-    </div>
   </div>
 </div>
 
