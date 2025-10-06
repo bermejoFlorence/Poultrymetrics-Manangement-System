@@ -126,8 +126,8 @@ if (!function_exists('current_user')) {
 }
 
 /* Where to send for login */
-$adminLoginRel = '/admin/login.php';
-if (!is_file($PM_ROOT.'/admin/login.php')) $adminLoginRel = '/login.php';
+$adminLoginRel = '/login.php';
+if (!is_file($PM_ROOT.'/login.php')) $adminLoginRel = '/login.php';
 if (!defined('ADMIN_LOGIN_URL')) define('ADMIN_LOGIN_URL', BASE_URI.$adminLoginRel);
 
 /* Guard: require admin except on exempt pages */
