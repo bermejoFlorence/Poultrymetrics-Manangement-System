@@ -1,10 +1,15 @@
 <?php
 /**
  * Common Layout Head (header + sidebar) | PoultryMetrics (ADMIN)
- * Include at the TOP of every admin page. Self-sufficient, tries root /inc/common.php,
- * and enforces ADMIN-ONLY access before any HTML output.
+ * Include at the TOP of every admin page.
+ * - Loads /config.php (must define $conn)
+ * - Enforces ADMIN-ONLY access
+ * - Provides helpers (null-safe) + header HTML + sidebar
  */
 declare(strict_types=1);
+
+/* ---------- Dev errors (optional; remove in production) ---------- */
+// ini_set('display_errors','1'); ini_set('display_startup_errors','1'); error_reporting(E_ALL);
 
 /* ---------- Session (must be first) ---------- */
 if (session_status() !== PHP_SESSION_ACTIVE) {
@@ -14,43 +19,39 @@ if (session_status() !== PHP_SESSION_ACTIVE) {
   session_start();
 }
 
-/* ---------- Try load ROOT common (preferred) ---------- */
-$rootCommon = dirname(__DIR__, 2) . '/inc/common.php';
-if (is_file($rootCommon)) {
-  require_once $rootCommon; // should define $conn, helpers, BASE_URI, etc.
+/* ---------- Require config (DB) ---------- */
+$cfgAdmin = dirname(__DIR__) . '/config.php';
+$cfgRoot  = dirname(__DIR__, 2) . '/config.php';
+
+if (is_file($cfgAdmin)) {
+  require_once $cfgAdmin;
+} elseif (is_file($cfgRoot)) {
+  require_once $cfgRoot;
+} else {
+  http_response_code(500);
+  die('Missing /config.php (not found in /admin or project root).');
 }
 
-/* ---------- If no $conn yet, boot minimal DB (admin-safe fallback) ---------- */
 if (!isset($conn) || !($conn instanceof mysqli)) {
-  // Try admin/config.php first, then root/config.php
-  $cfgAdmin = dirname(__DIR__) . '/config.php';
-  $cfgRoot  = dirname(__DIR__, 2) . '/config.php';
-  if (is_file($cfgAdmin)) require_once $cfgAdmin;
-  if (is_file($cfgRoot)  && !defined('DB_HOST')) require_once $cfgRoot;
-
-  if (!defined('DB_HOST')) define('DB_HOST','127.0.0.1');
-  if (!defined('DB_USER')) define('DB_USER','root');
-  if (!defined('DB_PASS')) define('DB_PASS','');
-  if (!defined('DB_NAME')) define('DB_NAME','poultrymetrics');
-  if (!defined('DB_PORT')) define('DB_PORT',3306);
-
-  mysqli_report(MYSQLI_REPORT_OFF);
-  $conn = @new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_PORT);
-  if ($conn && !$conn->connect_errno) {
-    @$conn->set_charset('utf8mb4');
-    @$conn->query("SET time_zone = '+08:00'");
-  } else {
-    // Soft fail: still allow header render, but no DB-backed widgets
-    $conn = null;
-  }
+  http_response_code(500);
+  die('DB connect failed or $conn not initialized in /config.php.');
 }
 
-/* ---------- Base helpers (only if missing) ---------- */
+/* ---------- Base helpers (null-safe) ---------- */
 if (!function_exists('h')) {
   function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 }
+if (!function_exists('scalar')) {
+  function scalar(?mysqli $c, string $sql){
+    if (!$c) return null;
+    $res = @$c->query($sql); if(!$res) return null;
+    $row = $res->fetch_row(); $res->free();
+    return $row ? $row[0] : null;
+  }
+}
 if (!function_exists('tableExists')) {
-  function tableExists(mysqli $c, string $tbl): bool {
+  function tableExists(?mysqli $c, string $tbl): bool {
+    if (!$c) return false;
     $sql="SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?";
     if(!$st=$c->prepare($sql)) return false;
     $st->bind_param('s',$tbl); $st->execute(); $st->store_result();
@@ -58,18 +59,12 @@ if (!function_exists('tableExists')) {
   }
 }
 if (!function_exists('colExists')) {
-  function colExists(mysqli $c, string $tbl, string $col): bool {
+  function colExists(?mysqli $c, string $tbl, string $col): bool {
+    if (!$c) return false;
     $sql="SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?";
     if(!$st=$c->prepare($sql)) return false;
     $st->bind_param('ss',$tbl,$col); $st->execute(); $st->store_result();
     $ok = $st->num_rows > 0; $st->close(); return $ok;
-  }
-}
-if (!function_exists('scalar')) {
-  function scalar(mysqli $c, string $sql){
-    $res = @$c->query($sql); if(!$res) return null;
-    $row = $res->fetch_row(); $res->free();
-    return $row ? $row[0] : null;
   }
 }
 
@@ -84,7 +79,6 @@ if (!defined('BASE_URI')) {
 /* ---------- ADMIN-ONLY AUTH GUARD (no output before this) ---------- */
 $role = strtolower((string)($_SESSION['role'] ?? ''));
 if (empty($_SESSION['user_id']) || $role !== 'admin') {
-  // Prefer /admin/login.php; fall back to /login.php
   $loginUrl = BASE_URI . (is_file(dirname(__DIR__) . '/login.php') ? '/admin/login.php' : '/login.php');
   header('Location: ' . $loginUrl);
   exit;
@@ -97,7 +91,7 @@ if (!isset($CURRENT))    $CURRENT    = basename($_SERVER['PHP_SELF'] ?? '');
 /* ---------- Logout URL ---------- */
 $LOGOUT_URL = BASE_URI . '/logout.php';
 
-/* ---------------- Active helper ---------------- */
+/* ---------------- Active helper for sidebar ---------------- */
 $__is_active = function($files) use ($CURRENT){
   $files = (array)$files;
   $cur   = strtolower($CURRENT);
@@ -107,41 +101,39 @@ $__is_active = function($files) use ($CURRENT){
 
 /* ---------------- Notifications (DB optional) ---------------- */
 $notif_count = 0; $notifs = [];
-if ($conn instanceof mysqli) {
-  // Pending customer orders
-  if (tableExists($conn,'customer_orders')) {
-    $pending_orders = (int)scalar($conn, "SELECT COUNT(*) FROM customer_orders WHERE status='pending'");
-    if ($pending_orders > 0) {
-      $notif_count += $pending_orders;
-      $notifs[] = ['label'=>"$pending_orders pending customer order(s)", 'url'=>'customer_orders.php?status=pending', 'icon'=>'fa-cart-shopping'];
-    }
+// Pending customer orders
+if (tableExists($conn,'customer_orders')) {
+  $pending_orders = (int)scalar($conn, "SELECT COUNT(*) FROM customer_orders WHERE status='pending'");
+  if ($pending_orders > 0) {
+    $notif_count += $pending_orders;
+    $notifs[] = ['label'=>"$pending_orders pending customer order(s)", 'url'=>'customer_orders.php?status=pending', 'icon'=>'fa-cart-shopping'];
   }
-  // Approval requests (table may vary)
-  $approvals_tbl = null;
-  if (tableExists($conn,'customer_approvals')) {
-    $approvals_tbl = 'customer_approvals';
-  } elseif (tableExists($conn,'account_approvals')) {
-    $approvals_tbl = 'account_approvals';
+}
+// Approval requests (flex table name)
+$approvals_tbl = null;
+if (tableExists($conn,'customer_approvals')) {
+  $approvals_tbl = 'customer_approvals';
+} elseif (tableExists($conn,'account_approvals')) {
+  $approvals_tbl = 'account_approvals';
+}
+if ($approvals_tbl) {
+  $pending_approvals = (int)scalar($conn, "SELECT COUNT(*) FROM {$approvals_tbl} WHERE status='pending'");
+  if ($pending_approvals > 0) {
+    $notif_count += $pending_approvals;
+    $notifs[] = ['label'=>"$pending_approvals customer approval request(s)", 'url'=>'customer_approvals.php?status=pending', 'icon'=>'fa-user-check'];
   }
-  if ($approvals_tbl) {
-    $pending_approvals = (int)scalar($conn, "SELECT COUNT(*) FROM {$approvals_tbl} WHERE status='pending'");
-    if ($pending_approvals > 0) {
-      $notif_count += $pending_approvals;
-      $notifs[] = ['label'=>"$pending_approvals customer approval request(s)", 'url'=>'customer_approvals.php?status=pending', 'icon'=>'fa-user-check'];
-    }
-  }
-  // Mortality today (optional schema)
-  $mortality_today = 0;
-  if (tableExists($conn,'egg_collections') && colExists($conn,'egg_collections','mortality') && colExists($conn,'egg_collections','collect_date')) {
-    $mortality_today = (int)scalar($conn, "SELECT COALESCE(SUM(mortality),0) FROM egg_collections WHERE collect_date=CURDATE()");
-  } elseif (tableExists($conn,'egg_production') && colExists($conn,'egg_production','mortality')) {
-    $dcol2 = colExists($conn,'egg_production','date') ? 'date' : (colExists($conn,'egg_production','collect_date') ? 'collect_date' : null);
-    if ($dcol2) $mortality_today = (int)scalar($conn, "SELECT COALESCE(SUM(mortality),0) FROM egg_production WHERE {$dcol2}=CURDATE()");
-  }
-  if (!empty($mortality_today)) {
-    $notif_count += 1;
-    $notifs[] = ['label'=>"$mortality_today mortality recorded today", 'url'=>'egg_reports.php?date='.date('Y-m-d'), 'icon'=>'fa-heart-crack'];
-  }
+}
+// Mortality today
+$mortality_today = 0;
+if (tableExists($conn,'egg_collections') && colExists($conn,'egg_collections','mortality') && colExists($conn,'egg_collections','collect_date')) {
+  $mortality_today = (int)scalar($conn, "SELECT COALESCE(SUM(mortality),0) FROM egg_collections WHERE collect_date=CURDATE()");
+} elseif (tableExists($conn,'egg_production') && colExists($conn,'egg_production','mortality')) {
+  $dcol2 = colExists($conn,'egg_production','date') ? 'date' : (colExists($conn,'egg_production','collect_date') ? 'collect_date' : null);
+  if ($dcol2) $mortality_today = (int)scalar($conn, "SELECT COALESCE(SUM(mortality),0) FROM egg_production WHERE {$dcol2}=CURDATE()");
+}
+if (!empty($mortality_today)) {
+  $notif_count += 1;
+  $notifs[] = ['label'=>"$mortality_today mortality recorded today", 'url'=>'egg_reports.php?date='.date('Y-m-d'), 'icon'=>'fa-heart-crack'];
 }
 ?>
 <!DOCTYPE html>
@@ -198,13 +190,6 @@ if ($conn instanceof mysqli) {
     body.sidebar-open .sidebar{transform:translateX(0)}
     body.sidebar-open .backdrop{opacity:1;visibility:visible}
   }
-
-  /* SweetAlert theme (optional) */
-  .swal-theme-popup{background: linear-gradient(180deg,#1f2327,#232a30);color: var(--text);border: 1px solid rgba(255,255,255,.06);border-radius: 14px !important;box-shadow: 0 18px 48px rgba(0,0,0,.35)}
-  .swal-theme-title{ color:#fff !important; font-weight:700 !important }
-  .swal-theme-html{ color:#cfd3d7 !important }
-  .swal-theme-confirm.swal2-styled{ background: var(--accent) !important; color: #151a1f !important; font-weight:700 !important; border-radius: 10px !important; padding: 10px 16px !important; border: 1px solid rgba(0,0,0,.08) !important; box-shadow: 0 6px 14px rgba(245,164,37,.35) !important }
-  .swal-theme-cancel.swal2-styled{ background: #343b44 !important; color: #e9ecef !important; border-radius: 10px !important; padding: 10px 14px !important; border: 1px solid rgba(255,255,255,.06) !important }
 
   .btn-icon-bell{ display:inline-flex; align-items:center; gap:.4rem }
   .btn-icon-bell .badge{ font-size:.65rem }
@@ -373,6 +358,24 @@ if ($conn instanceof mysqli) {
           setBurgerExpanded(!body.classList.contains('sidebar-collapsed'));
         }
       }
+
+      window.confirmLogout = function(){
+        if (!window.Swal) { window.location.href = LOGOUT_URL; return; }
+        Swal.fire({
+          title: 'Logout?',
+          text: 'You will be signed out of the admin session.',
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonText: 'Logout',
+          customClass: {
+            popup: 'swal-theme-popup',
+            title: 'swal-theme-title',
+            htmlContainer: 'swal-theme-html',
+            confirmButton: 'swal-theme-confirm',
+            cancelButton: 'swal-theme-cancel'
+          }
+        }).then((r)=>{ if(r.isConfirmed) window.location.href = LOGOUT_URL; });
+      };
 
       document.addEventListener('DOMContentLoaded', function(){
         if (burger){
