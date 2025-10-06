@@ -1,14 +1,17 @@
 <?php
 /**
- * accountant/inc/common.php
- * - Secure session
- * - Load config.php (search upward)
- * - Ensure $conn (mysqli) via pmx_connect() if available
+ * accountant/inc/common.php (config.php–driven, no DB_CHARSET, no pmx_connect)
+ * - Secure session (SameSite/HttpOnly; Secure if HTTPS)
+ * - Always require ROOT /config.php
+ * - Ensure $conn (mysqli): use existing $conn or connect via DB_* constants
  * - Safe DB helpers (tableExists/colExists/firstExistingCol, scalar)
  * - Role gate: allow roles 'accountant' and 'admin'
- * - Lightweight notifications ($notif_count, $notifs) using poultrymetrics schema
+ * - Minimal notifications ($notif_count, $notifs)
  */
 
+@date_default_timezone_set('Asia/Manila');
+
+/* --------- Secure session --------- */
 if (session_status() !== PHP_SESSION_ACTIVE) {
   $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
           || ((int)($_SERVER['SERVER_PORT'] ?? 80) === 443);
@@ -19,50 +22,40 @@ if (session_status() !== PHP_SESSION_ACTIVE) {
     'httponly' => true,
     'samesite' => 'Lax',
   ]);
+  ini_set('session.use_strict_mode', '1');
   session_start();
 }
-date_default_timezone_set('Asia/Manila');
 
-/* --------- Find and require config.php upward from this folder --------- */
-$__loaded = false;
-$__cur    = __DIR__; // /accountant/inc
-for ($i = 0; $i <= 8; $i++) {
-  $cand = $__cur . DIRECTORY_SEPARATOR . 'config.php';
-  if (is_file($cand)) { require_once $cand; $__loaded = true; break; }
-  $parent = dirname($__cur);
-  if ($parent === $__cur) break;
-  $__cur = $parent;
-}
-if (!$__loaded) {
+/* --------- Require ROOT /config.php --------- */
+$ROOT = dirname(__DIR__, 2);                 // .../Poultrymetrics
+$CFG  = $ROOT . DIRECTORY_SEPARATOR . 'config.php';
+if (!is_file($CFG)) {
   http_response_code(500);
   header('Content-Type: text/plain; charset=utf-8');
-  echo "config.php not found relative to accountant/inc/common.php\n";
-  echo "Place config.php at your project root (e.g., C:\\xampp\\htdocs\\Poultrymetrics\\config.php)\n";
+  echo "config.php not found at project root: {$CFG}\n";
   exit;
 }
+require_once $CFG;
 
-/* --------- Ensure $conn (mysqli) exists --------- */
+/* --------- Ensure $conn (mysqli) exists — NO pmx_connect, NO DB_CHARSET --------- */
 if (!isset($conn) || !($conn instanceof mysqli)) {
-  if (function_exists('pmx_connect')) {
-    try { $conn = pmx_connect(); } catch (Throwable $e) {
-      http_response_code(500);
-      exit('Database connection failed: '.$e->getMessage());
-    }
-  } elseif (defined('DB_HOST') && defined('DB_USER') && defined('DB_PASS') && defined('DB_NAME')) {
-    $conn = @new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME, defined('DB_PORT') ? DB_PORT : 3306);
-    if ($conn->connect_errno) {
-      http_response_code(500);
-      exit('Database connection failed: ' . $conn->connect_error);
-    }
-    if (method_exists($conn, 'set_charset')) $conn->set_charset(defined('DB_CHARSET') ? DB_CHARSET : 'utf8mb4');
-  } else {
+  if (!defined('DB_HOST') || !defined('DB_USER') || !defined('DB_PASS') || !defined('DB_NAME')) {
     http_response_code(500);
-    exit('Database connection ($conn) not initialized by config.php.');
+    exit('Database connection not initialized by config.php (missing DB_* constants).');
   }
+  mysqli_report(MYSQLI_REPORT_OFF); // switch to ERROR|STRICT temporarily if debugging
+  $port = defined('DB_PORT') ? (int)DB_PORT : 3306;
+  $conn = @new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME, $port);
+  if ($conn->connect_errno) {
+    http_response_code(500);
+    exit('Database connection error.');
+  }
+  // Hardcode utf8mb4 (do not use DB_CHARSET)
+  if (method_exists($conn, 'set_charset')) { $conn->set_charset('utf8mb4'); }
 }
 @$conn->query("SET time_zone = '+08:00'"); // MySQL session TZ
 
-/* --------- Helpers (exception-safe, no redeclare) --------- */
+/* --------- Helpers (no redeclare) --------- */
 if (!function_exists('h'))  { function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); } }
 if (!function_exists('esc')){ function esc($s){ return h($s); } } // alias
 
@@ -72,7 +65,7 @@ if (!function_exists('scalar')){
       $r = $c->query($sql);
       if (!$r) return null;
       $row = $r->fetch_row();
-      $r->free();
+      if ($r) $r->free();
       return $row ? $row[0] : null;
     } catch (Throwable $e) { return null; }
   }
@@ -83,7 +76,9 @@ if (!function_exists('tableExists')){
     try {
       $tbl = $c->real_escape_string($tbl);
       $r   = $c->query("SHOW TABLES LIKE '{$tbl}'");
-      return ($r && $r->num_rows > 0);
+      $ok  = ($r && $r->num_rows > 0);
+      if ($r) $r->free();
+      return $ok;
     } catch (Throwable $e) { return false; }
   }
 }
@@ -95,7 +90,9 @@ if (!function_exists('colExists')){
       $tbl = $c->real_escape_string($tbl);
       $col = $c->real_escape_string($col);
       $r   = $c->query("SHOW COLUMNS FROM `{$tbl}` LIKE '{$col}'");
-      return ($r && $r->num_rows > 0);
+      $ok  = ($r && $r->num_rows > 0);
+      if ($r) $r->free();
+      return $ok;
     } catch (Throwable $e) { return false; }
   }
 }
@@ -108,14 +105,21 @@ if (!function_exists('firstExistingCol')){
 }
 
 /* --------- Auth: allow only accountant or admin --------- */
+if (!function_exists('pmx_login_url')) {
+  function pmx_login_url(): string {
+    // Respect BASE_URI if defined in config.php; fallback to root /login.php
+    $base = defined('BASE_URI') ? rtrim((string)BASE_URI, '/') : '';
+    return ($base ?: '') . '/login.php';
+  }
+}
 $role = strtolower((string)($_SESSION['role'] ?? ''));
 if (empty($_SESSION['username']) || !in_array($role, ['accountant','admin'], true)) {
-  header('Location: /login.php');
+  header('Location: ' . pmx_login_url());
   exit;
 }
 
-/* --------- Notifications (minimal & robust for poultrymetrics schema) --------- */
-$notif_count = 0; 
+/* --------- Notifications (minimal & schema-aware) --------- */
+$notif_count = 0;
 $notifs = [];
 
 /* Unpaid / Partially paid orders */
@@ -125,42 +129,42 @@ if (tableExists($conn,'orders') && colExists($conn,'orders','payment_status')) {
     $notif_count += $due;
     $notifs[] = [
       'label' => "$due order(s) not fully paid",
-      'url'   => '/admin/orders.php?payment=due',
+      'url'   => (defined('BASE_URI') ? rtrim(BASE_URI,'/') : '') . '/admin/orders.php?payment=due',
       'icon'  => 'fa-receipt'
     ];
   }
 }
 
-/* Payments received today (count + quick link) */
+/* Payments received today */
 if (tableExists($conn,'payments') && colExists($conn,'payments','paid_at')) {
   $payCount = (int)(scalar($conn, "SELECT COUNT(*) FROM payments WHERE DATE(paid_at)=CURDATE()") ?? 0);
   if ($payCount > 0) {
-    $notif_count += 1; // one bubble for info
+    $notif_count += 1; // info bubble
     $notifs[] = [
       'label' => "$payCount payment(s) received today",
-      'url'   => '/admin/payments.php?date='.date('Y-m-d'),
+      'url'   => (defined('BASE_URI') ? rtrim(BASE_URI,'/') : '') . '/admin/payments.php?date='.date('Y-m-d'),
       'icon'  => 'fa-cash-register'
     ];
   }
 }
 
-/* Attendance logs today (uses att_date per schema; falls back if older) */
+/* Attendance logs today (att_date/date/log_date/work_date/attendance_date) */
 if (tableExists($conn,'attendance_logs')) {
   $dateCol = firstExistingCol($conn,'attendance_logs', ['att_date','date','log_date','work_date','attendance_date'], null);
   if ($dateCol) {
     $todayLogs = (int)(scalar($conn, "SELECT COUNT(*) FROM attendance_logs WHERE `$dateCol`=CURDATE()") ?? 0);
     if ($todayLogs > 0) {
-      $notif_count += 1; // informational bubble
+      $notif_count += 1;
       $notifs[] = [
         'label' => "$todayLogs attendance log(s) today",
-        'url'   => '/admin/attendance.php?date='.date('Y-m-d'),
+        'url'   => (defined('BASE_URI') ? rtrim(BASE_URI,'/') : '') . '/admin/attendance.php?date='.date('Y-m-d'),
         'icon'  => 'fa-user-clock'
       ];
     }
   }
 }
 
-/* Low stock products (uses products.stock_qty and optional reorder_level) */
+/* Low stock products (products.stock_qty [and optional reorder_level]) */
 if (tableExists($conn,'products') && colExists($conn,'products','stock_qty')) {
   $hasReorder = colExists($conn,'products','reorder_level');
   if ($hasReorder) {
@@ -173,7 +177,7 @@ if (tableExists($conn,'products') && colExists($conn,'products','stock_qty')) {
     $notif_count += $low_stock;
     $notifs[] = [
       'label' => "$low_stock product(s) in Low Stock",
-      'url'   => '/admin/products.php?filter=low',
+      'url'   => (defined('BASE_URI') ? rtrim(BASE_URI,'/') : '') . '/admin/products.php?filter=low',
       'icon'  => 'fa-clipboard-check'
     ];
   }
