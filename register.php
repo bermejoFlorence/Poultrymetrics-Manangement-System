@@ -3,16 +3,17 @@
 session_start();
 require_once __DIR__.'/config.php';
 
-/* ---------------- DB connect (prefer pmx_connect if available) ---------------- */
+/* ---------------- DB connect (via config.php only) ---------------- */
+mysqli_report(MYSQLI_REPORT_OFF);
 if (!isset($conn) || !($conn instanceof mysqli)) {
-  if (function_exists('pmx_connect')) {
-    $conn = pmx_connect();
-  } else {
-    $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME, defined('DB_PORT')?DB_PORT:3306);
-    if ($conn->connect_error) { die('DB connect error'); }
-    $conn->set_charset(defined('DB_CHARSET')?DB_CHARSET:'utf8mb4');
+  $port = defined('DB_PORT') ? DB_PORT : 3306;
+  $conn = @new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME, $port);
+  if ($conn->connect_errno) {
+    http_response_code(500);
+    die('DB connect error: '.$conn->connect_error);
   }
 }
+@$conn->set_charset('utf8mb4');
 @$conn->query("SET time_zone = '+08:00'");
 
 /* ---------------- Helpers (local to this file) ---------------- */
