@@ -1,14 +1,9 @@
 <?php
-// register.php — Customer account + store/location (STRICT schema)
-// - Uses hosting config.php for DB credentials
-// - Detects users PK (user_id or id) and falls back if insert_id is 0
-// - Creates/extends tables idempotently
-// - Queues account_approvals = 'pending'
-
+// register.php — Customer account + store/location; pending admin approval (schema-aware + auto-migrate)
 session_start();
 require_once __DIR__.'/config.php';
 
-/* ---------------- DB connect (via hosting config.php only) ---------------- */
+/* ---------------- DB connect (via config.php only) ---------------- */
 mysqli_report(MYSQLI_REPORT_OFF);
 if (!isset($conn) || !($conn instanceof mysqli)) {
   $port = defined('DB_PORT') ? DB_PORT : 3306;
@@ -21,112 +16,92 @@ if (!isset($conn) || !($conn instanceof mysqli)) {
 @$conn->set_charset('utf8mb4');
 @$conn->query("SET time_zone = '+08:00'");
 
-/* ---------------- Helpers ---------------- */
+/* ---------------- Helpers (local to this file) ---------------- */
 function esc($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
+function dbName(mysqli $c): string { $r=@$c->query("SELECT DATABASE()"); $d=$r?($r->fetch_row()[0]??''):''; if($r) $r->close(); return $d; }
 function tableExists(mysqli $c, string $n): bool {
   $e=$c->real_escape_string($n);
   $r=@$c->query("SHOW TABLES LIKE '$e'");
   return !!($r && $r->num_rows);
 }
+function columnExists(mysqli $c, string $t, string $col): bool {
+  $db=dbName($c);
+  if (!$db) return false;
+  $stmt=$c->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1");
+  if(!$stmt) return false;
+  $stmt->bind_param('sss',$db,$t,$col);
+  $stmt->execute(); $stmt->store_result();
+  $ok=$stmt->num_rows>0; $stmt->close();
+  return $ok;
+}
+function firstExisting(mysqli $c, string $t, array $cands){
+  foreach($cands as $x){ if(columnExists($c,$t,$x)) return $x; }
+  return null;
+}
 function ensureCol(mysqli $c, string $table, string $col, string $ddl){
-  $tbl = $c->real_escape_string($table);
-  $cl  = $c->real_escape_string($col);
-  $dbRes = @$c->query("SELECT 1
-                       FROM INFORMATION_SCHEMA.COLUMNS
-                       WHERE TABLE_SCHEMA = DATABASE()
-                         AND TABLE_NAME = '{$tbl}'
-                         AND COLUMN_NAME = '{$cl}'
-                       LIMIT 1");
-  $has = $dbRes && $dbRes->num_rows>0;
-  if ($dbRes) $dbRes->close();
-  if (!$has) { @$c->query("ALTER TABLE `{$tbl}` ADD COLUMN $ddl"); }
-}
-function users_pk(mysqli $c): string {
-  $r = @$c->query("SHOW COLUMNS FROM `users` LIKE 'user_id'");
-  if ($r && $r->num_rows) { $r->close(); return 'user_id'; }
-  if ($r) $r->close();
-  // default fallback
-  return 'id';
+  if (!columnExists($c, $table, $col)) { @$c->query("ALTER TABLE `$table` ADD COLUMN $ddl"); }
 }
 
-/* ---------------- Ensure tables/columns (idempotent) ---------------- */
-/* USERS (STRICT schema) */
+/* ---------------- Ensure auxiliary tables (idempotent) ---------------- */
 $conn->query("
-  CREATE TABLE IF NOT EXISTS `users` (
-    `user_id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    `email` VARCHAR(150) NOT NULL,
-    `username` VARCHAR(60) NOT NULL,
-    `password_hash` VARCHAR(255) NOT NULL,
-    `role` VARCHAR(30) NOT NULL DEFAULT 'customer',
-    `status` VARCHAR(20) NOT NULL DEFAULT 'pending',
-    `first_name` VARCHAR(100) NOT NULL,
-    `middle_name` VARCHAR(100) NULL,
-    `last_name` VARCHAR(100) NOT NULL,
-    `full_name` VARCHAR(255) NOT NULL,
-    `phone` VARCHAR(40) NULL,
-    `is_active` TINYINT(1) NOT NULL DEFAULT 0,
-    `is_approved` TINYINT(1) NOT NULL DEFAULT 0,
-    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    `updated_at` DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (`user_id`),
-    UNIQUE KEY `uniq_users_email` (`email`),
-    UNIQUE KEY `uniq_users_username` (`username`)
+  CREATE TABLE IF NOT EXISTS customer_profiles (
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id INT UNSIGNED NOT NULL,
+    customer_name VARCHAR(160) NOT NULL,
+    phone VARCHAR(40) NULL,
+    store_name VARCHAR(160) NOT NULL,
+    store_type VARCHAR(60) NULL,
+    address_line VARCHAR(255) NULL,
+    city VARCHAR(120) NULL,
+    province VARCHAR(120) NULL,
+    postal_code VARCHAR(20) NULL,
+    latitude DECIMAL(10,7) NULL,
+    longitude DECIMAL(10,7) NULL,
+    notes TEXT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX (user_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ");
-/* add missing columns if table existed already */
-ensureCol($conn,'users','status',      " `status` VARCHAR(20) NOT NULL DEFAULT 'pending' AFTER `role` ");
-ensureCol($conn,'users','full_name',   " `full_name` VARCHAR(255) NOT NULL AFTER `last_name` ");
-ensureCol($conn,'users','phone',       " `phone` VARCHAR(40) NULL AFTER `full_name` ");
-ensureCol($conn,'users','is_active',   " `is_active` TINYINT(1) NOT NULL DEFAULT 0 AFTER `phone` ");
-ensureCol($conn,'users','is_approved', " `is_approved` TINYINT(1) NOT NULL DEFAULT 0 AFTER `is_active` ");
-ensureCol($conn,'users','created_at',  " `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER `is_approved` ");
-ensureCol($conn,'users','updated_at',  " `updated_at` DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP AFTER `created_at` ");
+ensureCol($conn, 'customer_profiles', 'first_name',  "first_name  VARCHAR(100) NULL AFTER notes");
+ensureCol($conn, 'customer_profiles', 'middle_name', "middle_name VARCHAR(100) NULL AFTER first_name");
+ensureCol($conn, 'customer_profiles', 'last_name',   "last_name   VARCHAR(100) NULL AFTER middle_name");
 
-/* CUSTOMER PROFILES (STRICT schema) — create WITHOUT FK first (we’ll add FK dynamically) */
 $conn->query("
-  CREATE TABLE IF NOT EXISTS `customer_profiles` (
-    `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    `user_id` INT UNSIGNED NOT NULL,
-    `customer_name` VARCHAR(160) NOT NULL,
-    `phone` VARCHAR(40) NULL,
-    `store_name` VARCHAR(160) NOT NULL,
-    `store_type` VARCHAR(60) NULL,
-    `address_line` VARCHAR(255) NULL,
-    `city` VARCHAR(120) NULL,
-    `province` VARCHAR(120) NULL,
-    `postal_code` VARCHAR(20) NULL,
-    `latitude` DECIMAL(10,7) NULL,
-    `longitude` DECIMAL(10,7) NULL,
-    `notes` TEXT NULL,
-    `first_name` VARCHAR(100) NULL,
-    `middle_name` VARCHAR(100) NULL,
-    `last_name` VARCHAR(100) NULL,
-    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (`id`),
-    KEY `idx_cp_user` (`user_id`)
+  CREATE TABLE IF NOT EXISTS account_approvals (
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id INT UNSIGNED NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    note VARCHAR(255) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX (user_id), INDEX (status)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ");
 
-/* ACCOUNT APPROVALS (queue) */
-$conn->query("
-  CREATE TABLE IF NOT EXISTS `account_approvals` (
-    `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    `user_id` INT UNSIGNED NOT NULL,
-    `status` VARCHAR(20) NOT NULL DEFAULT 'pending',
-    `note` VARCHAR(255) NULL,
-    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (`id`),
-    KEY `idx_appr_user` (`user_id`),
-    KEY `idx_appr_status` (`status`)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-");
+/* ---------------- Discover users table + columns ---------------- */
+$USERS_TBL = 'users';
+if (!tableExists($conn, $USERS_TBL)) { http_response_code(500); die('Users table not found.'); }
 
-/* Try to add FK on customer_profiles.user_id -> users.(user_id|id) (ignore errors) */
-$usersPk = users_pk($conn);
-@$conn->query("ALTER TABLE `customer_profiles` DROP FOREIGN KEY `fk_cp_user`");
-@$conn->query("ALTER TABLE `customer_profiles`
-  ADD CONSTRAINT `fk_cp_user` FOREIGN KEY (`user_id`)
-  REFERENCES `users`(`$usersPk`) ON DELETE CASCADE");
+$COL_ID       = firstExisting($conn,$USERS_TBL,['user_id','id']);
+$COL_EMAIL    = firstExisting($conn,$USERS_TBL,['email','email_address']);
+$COL_PASS     = firstExisting($conn,$USERS_TBL,['password_hash','password','passwd']);
+if (!$COL_ID || !$COL_EMAIL || !$COL_PASS) { http_response_code(500); die('Users table must have id/email/password columns.'); }
+
+$COL_USER     = firstExisting($conn,$USERS_TBL,['username','user_name']); // optional
+$COL_ROLE     = firstExisting($conn,$USERS_TBL,['role','user_role']);     // optional
+$COL_PHONE    = firstExisting($conn,$USERS_TBL,['phone','phone_number','mobile']); // optional
+$COL_STATUS   = firstExisting($conn,$USERS_TBL,['status','account_status']);       // optional
+$COL_ACTIVE   = firstExisting($conn,$USERS_TBL,['is_active','active','enabled']);  // optional
+$COL_APPROVED = firstExisting($conn,$USERS_TBL,['is_approved','approved','verified','is_verified']); // optional
+$COL_FIRST    = firstExisting($conn,$USERS_TBL,['first_name','given_name','fname','firstname']);     // optional
+$COL_MIDDLE   = firstExisting($conn,$USERS_TBL,['middle_name','mname','middlename']);                 // optional
+$COL_LAST     = firstExisting($conn,$USERS_TBL,['last_name','family_name','lname','lastname']);      // optional
+$COL_FULL     = firstExisting($conn,$USERS_TBL,['full_name','name']);                                // optional (NEW)
+
+/* ---------------- Approvals table columns ---------------- */
+$APPROVALS_TBL = 'account_approvals';
+$APPROVAL_UID_COL  = 'user_id';
+$APPROVAL_NOTE_COL = 'note';
+$APPROVAL_STAT_COL = 'status';
 
 /* ---------------- CSRF ---------------- */
 if (empty($_SESSION['csrf_reg'])) $_SESSION['csrf_reg'] = bin2hex(random_bytes(32));
@@ -150,7 +125,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $first_name    = trim($_POST['first_name'] ?? '');
     $middle_name   = trim($_POST['middle_name'] ?? '');
     $last_name     = trim($_POST['last_name'] ?? '');
-    $full_name     = trim($first_name . ' ' . ($middle_name !== '' ? $middle_name . ' ' : '') . $last_name);
+    $customer_name = trim($first_name . ' ' . ($middle_name !== '' ? $middle_name . ' ' : '') . $last_name);
+    $full_for_users= trim($first_name . ' ' . ($middle_name !== '' ? $middle_name . ' ' : '') . $last_name);
 
     // Store
     $store_name    = trim($_POST['store_name'] ?? '');
@@ -163,9 +139,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $longitude     = trim($_POST['longitude'] ?? '');
     $notes         = trim($_POST['notes'] ?? '');
 
-    // ---- Validate ----
-    if ($username==='' || $email==='' || $password==='' || $first_name==='' || $last_name==='' || $store_name==='') {
-      $flash = "Please complete Username, Email, Password, First Name, Last Name, and Store Name.";
+    // ---- Validate (username required only if column exists) ----
+    $needUsername = !is_null($COL_USER);
+    if (($needUsername && $username==='') || $email==='' || $password==='' || $first_name==='' || $last_name==='' || $store_name==='') {
+      $fields = $needUsername ? "Username, Email, Password, First Name, Last Name, and Store Name" : "Email, Password, First Name, Last Name, and Store Name";
+      $flash = "Please complete $fields.";
       $flashType='danger';
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
       $flash = "Please provide a valid email address.";
@@ -174,88 +152,70 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $flash = "Password must be at least 8 characters.";
       $flashType='danger';
     } else {
-      // ---- Duplicate check (username/email)
-      $dup = $conn->prepare("SELECT {$usersPk} FROM users WHERE email=? OR username=? LIMIT 1");
-      $dup->bind_param('ss',$email,$username);
-      $dup->execute(); $dup->store_result();
-      $exists = $dup->num_rows>0; $dup->close();
+      // ---- Duplicate check (email required; username/phone optional) ----
+      $clauses = ["$COL_EMAIL = ?"]; $types   = "s"; $vals    = [$email];
+      if ($needUsername && $username!==''){ $clauses[] = "$COL_USER = ?";  $types .= 's'; $vals[] = $username; }
+      if ($COL_PHONE && $phone!==''){       $clauses[] = "$COL_PHONE = ?"; $types .= 's'; $vals[] = $phone; }
+
+      $dupSql = "SELECT $COL_ID FROM $USERS_TBL WHERE ".implode(' OR ',$clauses)." LIMIT 1";
+      if (!($chk=$conn->prepare($dupSql))) { $flash='Unable to validate duplicates.'; $flashType='danger'; goto render; }
+      $chk->bind_param($types, ...$vals); $chk->execute();
+      $dups=$chk->get_result(); $exists = $dups && $dups->num_rows>0; $chk->close();
 
       if ($exists){
-        $flash="An account with the same username or email already exists.";
+        $flash="An account with the same ".($needUsername?'username, ':'')."email".($COL_PHONE?', or phone':'')." already exists.";
         $flashType='danger';
       } else {
         // ---------------- Transaction: users + profile + approval ----------------
         $conn->begin_transaction();
         try {
-          // Users insert (STRICT columns)
-          $hash = password_hash($password, PASSWORD_DEFAULT);
-          $u = $conn->prepare("
-            INSERT INTO users
-              (email, username, password_hash, role, status,
-               first_name, middle_name, last_name, full_name, phone,
-               is_active, is_approved, created_at)
-            VALUES
-              (?, ?, ?, 'customer', 'pending',
-               ?, ?, ?, ?, ?,
-               0, 0, NOW())
-          ");
-          if (!$u) throw new Exception('Account insert prepare failed.');
-          $u->bind_param('ssssssss',
-            $email, $username, $hash,
-            $first_name, $middle_name, $last_name, $full_name, $phone
-          );
-          if (!$u->execute()) throw new Exception('Account insert failed.');
-          $userId = (int)$conn->insert_id;
-          $u->close();
+          // ---- Build INSERT into users dynamically ----
+          $cols = [$COL_EMAIL, $COL_PASS];
+          $qms  = ['?','?'];
+          $typesU = 'ss';
+          $valsU  = [$email, password_hash($password,PASSWORD_DEFAULT)];
 
-          // Fallback if insert_id is 0 (triggers/no AI or different PK)
-          if ($userId <= 0) {
-            $pk = users_pk($conn);
-            $sel = $conn->prepare("SELECT `$pk` FROM users WHERE email=? LIMIT 1");
-            if (!$sel) throw new Exception('Unable to obtain user id.');
-            $sel->bind_param('s', $email);
-            $sel->execute();
-            $sel->bind_result($fetched);
-            $sel->fetch();
-            $sel->close();
-            $userId = (int)$fetched;
-          }
-          if ($userId <= 0) throw new Exception('Could not obtain user id after insert.');
+          if ($COL_ROLE){   $cols[]=$COL_ROLE;   $qms[]='?'; $typesU.='s'; $valsU[]='customer'; }
+          if ($needUsername){ $cols[]=$COL_USER; $qms[]='?'; $typesU.='s'; $valsU[]=$username; }
+          if ($COL_PHONE && $phone!==''){ $cols[]=$COL_PHONE; $qms[]='?'; $typesU.='s'; $valsU[]=$phone; }
+          if ($COL_FIRST){  $cols[]=$COL_FIRST;  $qms[]='?'; $typesU.='s'; $valsU[]=$first_name; }
+          if ($COL_MIDDLE){ $cols[]=$COL_MIDDLE; $qms[]='?'; $typesU.='s'; $valsU[]=$middle_name; }
+          if ($COL_LAST){   $cols[]=$COL_LAST;   $qms[]='?'; $typesU.='s'; $valsU[]=$last_name; }
+          if ($COL_FULL){   $cols[]=$COL_FULL;   $qms[]='?'; $typesU.='s'; $valsU[]=$full_for_users; } // NEW
+          if ($COL_STATUS){ $cols[]=$COL_STATUS; $qms[]='?'; $typesU.='s'; $valsU[]='pending'; }
+          if ($COL_ACTIVE){ $cols[]=$COL_ACTIVE; $qms[]='?'; $typesU.='i'; $valsU[]=0; }
+          if ($COL_APPROVED){ $cols[]=$COL_APPROVED; $qms[]='?'; $typesU.='i'; $valsU[]=0; }
 
-          // Customer profile insert (STRICT columns)
-          $cp = $conn->prepare("
-            INSERT INTO customer_profiles
-              (user_id, customer_name, phone, store_name, store_type,
-               address_line, city, province, postal_code, latitude, longitude,
-               notes, first_name, middle_name, last_name, created_at)
-            VALUES
-              (?, ?, ?, ?, ?,
-               ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''),
-               ?, ?, ?, ?, NOW())
-          ");
-          if (!$cp) throw new Exception('Profile insert prepare failed.');
-          $customer_name = $full_name;
-          $cp->bind_param(
-            'issssssssssssss',
-            $userId, $customer_name, $phone, $store_name, $store_type,
-            $address_line, $city, $province, $postal_code, $latitude, $longitude,
-            $notes, $first_name, $middle_name, $last_name
-          );
-          if (!$cp->execute()) throw new Exception('Profile insert failed.');
-          $cp->close();
+          $sqlUsers="INSERT INTO $USERS_TBL (".implode(',',$cols).") VALUES (".implode(',',$qms).")";
+          $ins=$conn->prepare($sqlUsers);
+          if(!$ins){ throw new Exception('Unable to prepare account insert.'); }
+          $ins->bind_param($typesU, ...$valsU);
+          if (!$ins->execute()){ throw new Exception('Account insert failed.'); }
+          $userId = (int)$ins->insert_id; $ins->close();
 
-          // Account approval queue
+          // ---- Insert customer profile (always store name parts too) ----
+          $cpCols = ['user_id','customer_name','phone','store_name','store_type','address_line','city','province','postal_code','latitude','longitude','notes','first_name','middle_name','last_name'];
+          $cpVals = [$userId,$customer_name,$phone,$store_name,$store_type,$address_line,$city,$province,$postal_code,$latitude,$longitude,$notes,$first_name,$middle_name,$last_name];
+          $cpQms  = array_map(function($c){ return ($c==='latitude'||$c==='longitude') ? "NULLIF(?, '')" : "?"; }, $cpCols);
+          $cpTypes= 'i' . str_repeat('s', count($cpCols)-1); // 1 int + 14 strings
+
+          $sqlCP = "INSERT INTO customer_profiles (".implode(',',$cpCols).") VALUES (".implode(',',$cpQms).")";
+          $p = $conn->prepare($sqlCP);
+          if (!$p){ throw new Exception('Profile insert prepare failed.'); }
+          $p->bind_param($cpTypes, ...$cpVals);
+          if (!$p->execute()){ throw new Exception('Profile insert failed.'); }
+          $p->close();
+
+          // ---- Queue approval ----
           $note = 'Self-registration: customer account';
-          $a = $conn->prepare("INSERT INTO account_approvals (user_id, status, note, created_at) VALUES (?, 'pending', ?, NOW())");
-          if (!$a) throw new Exception('Approval insert prepare failed.');
-          $a->bind_param('is',$userId,$note);
-          if (!$a->execute()) throw new Exception('Approval insert failed.');
+          $sqlA = "INSERT INTO $APPROVALS_TBL ($APPROVAL_UID_COL, $APPROVAL_STAT_COL, $APPROVAL_NOTE_COL) VALUES (?, 'pending', ?)";
+          $a = $conn->prepare($sqlA);
+          if (!$a){ throw new Exception('Approval insert prepare failed.'); }
+          $a->bind_param("is",$userId,$note);
+          if (!$a->execute()){ throw new Exception('Approval insert failed.'); }
           $a->close();
 
           $conn->commit();
-
-          // (Optional) auto-login
-          // $_SESSION['user_id'] = $userId;
 
           $flash = "Registration submitted. Your account is pending admin approval.";
           $flashType='success';
@@ -272,6 +232,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   }
 }
 
+render:
 /* ---------------- CSRF token for form ---------------- */
 $csrf = $_SESSION['csrf_reg'];
 ?>
@@ -366,13 +327,17 @@ $csrf = $_SESSION['csrf_reg'];
           <!-- Account -->
           <div class="form-section-title mt-1"><i class="fa fa-user"></i> Account Details</div>
           <div class="row g-3">
+            <?php if (!is_null($COL_USER)): ?>
             <div class="col-md-6">
               <label class="form-label">Username*</label>
               <input type="text" name="username" class="form-control" required minlength="3" maxlength="60" value="<?php echo esc($_POST['username'] ?? ''); ?>">
             </div>
             <div class="col-md-6">
+            <?php else: ?>
+            <div class="col-md-12">
+            <?php endif; ?>
               <label class="form-label">Email*</label>
-              <input type="email" name="email" class="form-control" required maxlength="150" value="<?php echo esc($_POST['email'] ?? ''); ?>">
+              <input type="email" name="email" class="form-control" required maxlength="120" value="<?php echo esc($_POST['email'] ?? ''); ?>">
             </div>
             <div class="col-md-6">
               <label class="form-label">Phone</label>
@@ -538,9 +503,7 @@ $csrf = $_SESSION['csrf_reg'];
       lngText.textContent = lngInput.value;
     }
 
-    if (latInput.value && lngInput.value){
-      placeMarker(parseFloat(latInput.value), parseFloat(lngInput.value));
-    }
+    if (latInput.value && lngInput.value){ placeMarker(parseFloat(latInput.value), parseFloat(lngInput.value)); }
     map.on('click', function(e){ placeMarker(e.latlng.lat, e.latlng.lng); });
 
     useMyLocation.addEventListener('change', function(){
