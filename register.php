@@ -1,16 +1,10 @@
 <?php
-// register.php — Customer account + store/location (STRICT schema as requested)
-// users table columns:
-//   user_id, email, username, password_hash, role, status,
-//   first_name, middle_name, last_name, full_name, phone,
-//   is_active, is_approved, created_at, updated_at
-//
-// customer_profiles columns:
-//   id, user_id, customer_name, phone, store_name, store_type,
-//   address_line, city, province, postal_code, latitude, longitude,
-//   notes, first_name, middle_name, last_name, created_at
-//
-// Also writes to account_approvals(user_id,status,note,created_at) = 'pending'
+// register.php — Customer account + store/location (STRICT schema)
+// - Uses hosting config.php for DB credentials
+// - Detects users PK (user_id or id) and falls back if insert_id is 0
+// - Creates/extends tables idempotently
+// - Queues account_approvals = 'pending'
+
 session_start();
 require_once __DIR__.'/config.php';
 
@@ -47,6 +41,13 @@ function ensureCol(mysqli $c, string $table, string $col, string $ddl){
   if ($dbRes) $dbRes->close();
   if (!$has) { @$c->query("ALTER TABLE `{$tbl}` ADD COLUMN $ddl"); }
 }
+function users_pk(mysqli $c): string {
+  $r = @$c->query("SHOW COLUMNS FROM `users` LIKE 'user_id'");
+  if ($r && $r->num_rows) { $r->close(); return 'user_id'; }
+  if ($r) $r->close();
+  // default fallback
+  return 'id';
+}
 
 /* ---------------- Ensure tables/columns (idempotent) ---------------- */
 /* USERS (STRICT schema) */
@@ -72,7 +73,7 @@ $conn->query("
     UNIQUE KEY `uniq_users_username` (`username`)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ");
-/* make sure columns exist in case table already existed with fewer cols */
+/* add missing columns if table existed already */
 ensureCol($conn,'users','status',      " `status` VARCHAR(20) NOT NULL DEFAULT 'pending' AFTER `role` ");
 ensureCol($conn,'users','full_name',   " `full_name` VARCHAR(255) NOT NULL AFTER `last_name` ");
 ensureCol($conn,'users','phone',       " `phone` VARCHAR(40) NULL AFTER `full_name` ");
@@ -81,7 +82,7 @@ ensureCol($conn,'users','is_approved', " `is_approved` TINYINT(1) NOT NULL DEFAU
 ensureCol($conn,'users','created_at',  " `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP AFTER `is_approved` ");
 ensureCol($conn,'users','updated_at',  " `updated_at` DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP AFTER `created_at` ");
 
-/* CUSTOMER PROFILES (STRICT schema) */
+/* CUSTOMER PROFILES (STRICT schema) — create WITHOUT FK first (we’ll add FK dynamically) */
 $conn->query("
   CREATE TABLE IF NOT EXISTS `customer_profiles` (
     `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -102,8 +103,7 @@ $conn->query("
     `last_name` VARCHAR(100) NULL,
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
-    KEY `idx_cp_user` (`user_id`),
-    CONSTRAINT `fk_cp_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
+    KEY `idx_cp_user` (`user_id`)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ");
 
@@ -117,10 +117,16 @@ $conn->query("
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
     KEY `idx_appr_user` (`user_id`),
-    KEY `idx_appr_status` (`status`),
-    CONSTRAINT `fk_appr_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
+    KEY `idx_appr_status` (`status`)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ");
+
+/* Try to add FK on customer_profiles.user_id -> users.(user_id|id) (ignore errors) */
+$usersPk = users_pk($conn);
+@$conn->query("ALTER TABLE `customer_profiles` DROP FOREIGN KEY `fk_cp_user`");
+@$conn->query("ALTER TABLE `customer_profiles`
+  ADD CONSTRAINT `fk_cp_user` FOREIGN KEY (`user_id`)
+  REFERENCES `users`(`$usersPk`) ON DELETE CASCADE");
 
 /* ---------------- CSRF ---------------- */
 if (empty($_SESSION['csrf_reg'])) $_SESSION['csrf_reg'] = bin2hex(random_bytes(32));
@@ -169,7 +175,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $flashType='danger';
     } else {
       // ---- Duplicate check (username/email)
-      $dup = $conn->prepare("SELECT user_id FROM users WHERE email=? OR username=? LIMIT 1");
+      $dup = $conn->prepare("SELECT {$usersPk} FROM users WHERE email=? OR username=? LIMIT 1");
       $dup->bind_param('ss',$email,$username);
       $dup->execute(); $dup->store_result();
       $exists = $dup->num_rows>0; $dup->close();
@@ -199,8 +205,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $first_name, $middle_name, $last_name, $full_name, $phone
           );
           if (!$u->execute()) throw new Exception('Account insert failed.');
-          $userId = (int)$u->insert_id;
+          $userId = (int)$conn->insert_id;
           $u->close();
+
+          // Fallback if insert_id is 0 (triggers/no AI or different PK)
+          if ($userId <= 0) {
+            $pk = users_pk($conn);
+            $sel = $conn->prepare("SELECT `$pk` FROM users WHERE email=? LIMIT 1");
+            if (!$sel) throw new Exception('Unable to obtain user id.');
+            $sel->bind_param('s', $email);
+            $sel->execute();
+            $sel->bind_result($fetched);
+            $sel->fetch();
+            $sel->close();
+            $userId = (int)$fetched;
+          }
+          if ($userId <= 0) throw new Exception('Could not obtain user id after insert.');
 
           // Customer profile insert (STRICT columns)
           $cp = $conn->prepare("
@@ -233,6 +253,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           $a->close();
 
           $conn->commit();
+
+          // (Optional) auto-login
+          // $_SESSION['user_id'] = $userId;
 
           $flash = "Registration submitted. Your account is pending admin approval.";
           $flashType='success';
@@ -515,7 +538,9 @@ $csrf = $_SESSION['csrf_reg'];
       lngText.textContent = lngInput.value;
     }
 
-    if (latInput.value && lngInput.value){ placeMarker(parseFloat(latInput.value), parseFloat(latInput.value)); }
+    if (latInput.value && lngInput.value){
+      placeMarker(parseFloat(latInput.value), parseFloat(lngInput.value));
+    }
     map.on('click', function(e){ placeMarker(e.latlng.lat, e.latlng.lng); });
 
     useMyLocation.addEventListener('change', function(){
