@@ -1,9 +1,9 @@
 <?php
 // =====================================================================
 // /admin/users.php — schema-aware Users list (no auth enforcement)
-// - Works with INT/CHAR PK and BINARY(16) UUID PKs (HEX in UI, UNHEX in WHERE)
-// - Status toggles: write users.status if present; else use is_active/approved
-// - Name column intentionally not shown in the table (still saved on create)
+// - Robust include of common.php (root /inc first, then /admin/inc fallback)
+// - Status toggles: AUTO-map to valid enum values with correct CASE
+// - Create/Approve/Disable/Delete: works for numeric OR string (UUID) PKs
 // =====================================================================
 
 // ---- Robust common include: prefer ROOT /inc/common.php, fallback to /admin/inc/common.php
@@ -19,7 +19,7 @@ if (is_file($ROOT_COMMON)) {
   exit;
 }
 
-// ---------- Safety shims (in case common.php didn’t declare them) ----------
+// ---------- Safety shims ----------
 if (!function_exists('tableExists')) {
   function tableExists(mysqli $c, string $t): bool {
     $sql = "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?";
@@ -36,14 +36,14 @@ if (!function_exists('colExists')) {
     $ok = $st->num_rows > 0; $st->close(); return $ok;
   }
 }
+if (!function_exists('h')) {
+  function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
+}
 if (!function_exists('scalar')) {
   function scalar(mysqli $c, string $sql){
     $r = @$c->query($sql); if(!$r) return null; $row = $r->fetch_row(); $r->free();
     return $row ? $row[0] : null;
   }
-}
-if (!function_exists('h')) {
-  function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 }
 
 // ---------- Page config ----------
@@ -73,7 +73,7 @@ if (!function_exists('flash_get')) {
   }
 }
 
-// ---------- Roles ----------
+// ---------- Helpers ----------
 $ALL_ROLES = ['admin','accountant','worker','customer'];
 function sanitize_role($r){
   $r = strtolower(trim((string)$r)); global $ALL_ROLES;
@@ -84,19 +84,83 @@ function split_name($full){
   $p=explode(' ',$full); $first=array_shift($p); return [$first,implode(' ',$p)];
 }
 
+/**
+ * Return column meta: ['type' => 'enum(...)'|'varchar...'|..., 'enum_map' => [lower=>exact, ...]]
+ * enum_map preserves original CASE for saving; keys are lowercase for matching.
+ */
+function column_meta(mysqli $c, string $table, string $col): array {
+  $sql="SELECT DATA_TYPE, COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1";
+  $st=$c->prepare($sql); if(!$st) return ['type'=>null,'enum_map'=>[]];
+  $st->bind_param('ss',$table,$col); $st->execute();
+  $row=$st->get_result()->fetch_assoc() ?: []; $st->close();
+  $dataType = strtolower((string)($row['DATA_TYPE']??''));
+  $colType  = (string)($row['COLUMN_TYPE']??'');
+  $map=[];
+  if ($dataType==='enum' && stripos($colType,'enum(')===0){
+    $inside = trim(substr($colType,5,-1));
+    $parts = preg_split('/,(?=(?:[^\'"]|\'[^\']*\'|"[^"]*")*$)/',$inside);
+    foreach ($parts as $p){
+      $tok = trim($p," \t\n\r\0\x0B'\"");
+      if ($tok!=='') $map[strtolower($tok)] = $tok;
+    }
+  }
+  return ['type'=>$colType, 'enum_map'=>$map];
+}
+/** Pick a legal status string from preferred list; returns EXACT token to save (from enum_map) */
+function pick_status_exact(array $enum_map, array $preferred, ?string $fallback=null): ?string {
+  if ($enum_map){
+    foreach ($preferred as $p){
+      $k = strtolower($p);
+      if (isset($enum_map[$k])) return $enum_map[$k];
+    }
+    $first = reset($enum_map);
+    return $first!==false ? $first : null;
+  }
+  return $preferred[0] ?? $fallback;
+}
+
+/** Detect if PK is numeric by checking DATA_TYPE */
+function pk_info(mysqli $c, string $table, string $pkcol): array {
+  $sql="SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1";
+  $st=$c->prepare($sql); if(!$st) return ['numeric'=>true,'bind'=>'i'];
+  $st->bind_param('ss',$table,$pkcol); $st->execute();
+  $row=$st->get_result()->fetch_assoc(); $st->close();
+  $dt=strtolower((string)($row['DATA_TYPE']??'int'));
+  $numeric = in_array($dt, ['int','bigint','smallint','mediumint','tinyint','decimal','double','float'], true);
+  return ['numeric'=>$numeric,'bind'=>$numeric?'i':'s'];
+}
+
 // ---------- Users schema map ----------
 $U_TBL = 'users';
-$U_PK  = colExists($conn,$U_TBL,'id') ? 'id' :
-         (colExists($conn,$U_TBL,'user_id') ? 'user_id' : 'id');
 
-$has_username = colExists($conn,$U_TBL,'username');
-$has_email    = colExists($conn,$U_TBL,'email') || colExists($conn,$U_TBL,'email_address');
+// PK
+$U_PK  = colExists($conn,$U_TBL,'id') ? 'id' :
+         (colExists($conn,$U_TBL,'user_id') ? 'user_id' :
+         (colExists($conn,$U_TBL,'uid') ? 'uid' :
+         (colExists($conn,$U_TBL,'users_id') ? 'users_id' : 'id')));
+$PKI = pk_info($conn,$U_TBL,$U_PK);
+$PK_IS_NUM = $PKI['numeric'];
+$PK_BIND   = $PKI['bind']; // 'i' or 's'
+
+// username
+$uname_col = colExists($conn,$U_TBL,'username') ? 'username' :
+             (colExists($conn,$U_TBL,'user_name') ? 'user_name' : null);
+$has_username = (bool)$uname_col;
+
+// email
 $email_col    = colExists($conn,$U_TBL,'email') ? 'email' :
                (colExists($conn,$U_TBL,'email_address') ? 'email_address' : null);
+$has_email    = (bool)$email_col;
 
+// password
 $pwd_col = colExists($conn,$U_TBL,'password_hash') ? 'password_hash' :
-          (colExists($conn,$U_TBL,'password') ? 'password' : null);
+          (colExists($conn,$U_TBL,'password') ? 'password' :
+          (colExists($conn,$U_TBL,'pass') ? 'pass' :
+          (colExists($conn,$U_TBL,'pwd') ? 'pwd' : null)));
 
+// role
 $has_role_col = colExists($conn,$U_TBL,'role');
 
 // name columns (used on create/search; not displayed)
@@ -106,15 +170,20 @@ $has_fn       = colExists($conn,$U_TBL,'first_name');
 $has_ln       = colExists($conn,$U_TBL,'last_name');
 $fullname_expr = $has_full ? "full_name"
                : ($has_name ? "name"
-               : (($has_fn||$has_ln) ? "TRIM(CONCAT(COALESCE(first_name,''),' ',COALESCE(last_name,'')))" : "username"));
+               : (($has_fn||$has_ln) ? "TRIM(CONCAT(COALESCE(first_name,''),' ',COALESCE(last_name,'')))" : ($uname_col ?? "'User'")));
 
-$has_created_at = colExists($conn,$U_TBL,'created_at');
+// dates
+$has_created_at = colExists($conn,$U_TBL,'created_at') || colExists($conn,$U_TBL,'created') || colExists($conn,$U_TBL,'registered_at');
+$created_col    = colExists($conn,$U_TBL,'created_at') ? 'created_at' :
+                 (colExists($conn,$U_TBL,'created') ? 'created' :
+                 (colExists($conn,$U_TBL,'registered_at') ? 'registered_at' : null));
 $has_updated_at = colExists($conn,$U_TBL,'updated_at');
-$orderExpr      = $has_created_at ? "created_at DESC, `$U_PK` DESC" : "`$U_PK` DESC";
-$created_col    = $has_created_at ? 'created_at' : null;
+
+// order
+$orderExpr      = $created_col ? "`$created_col` DESC, `$U_PK` DESC" : "`$U_PK` DESC";
 
 // status support
-$status_col       = colExists($conn,$U_TBL,'status') ? 'status' : null; // 'active' / 'inactive' / 'pending'
+$status_col       = colExists($conn,$U_TBL,'status') ? 'status' : null; // may be ENUM or VARCHAR
 $gate_active_col  = colExists($conn,$U_TBL,'is_active')   ? 'is_active'
                   : (colExists($conn,$U_TBL,'active')     ? 'active'
                   : (colExists($conn,$U_TBL,'enabled')    ? 'enabled' : null));
@@ -125,54 +194,41 @@ $gate_approve_col = colExists($conn,$U_TBL,'is_approved') ? 'is_approved'
 
 $supportToggle = (bool)($status_col || $gate_active_col || $gate_approve_col);
 
-$HAS_CO = tableExists($conn,'customer_orders') && colExists($conn,'customer_orders','customer_id');
+// column meta for status
+$STATUS_META     = $status_col ? column_meta($conn,$U_TBL,$status_col) : ['type'=>null,'enum_map'=>[]];
+$STATUS_ENUM_MAP = $STATUS_META['enum_map']; // [lower => ExactToken]
 
-// ---------- PK type detection (INT/CHAR vs BINARY) ----------
-function pk_info(mysqli $c, string $table, string $pkcol): array {
-  $sql="SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1";
-  $st=$c->prepare($sql); if(!$st) return ['numeric'=>true,'bind'=>'i','binary'=>false];
-  $st->bind_param('ss',$table,$pkcol); $st->execute();
-  $row=$st->get_result()->fetch_assoc(); $st->close();
-  $dt=strtolower((string)($row['DATA_TYPE']??'int'));
-  $isBinary  = in_array($dt, ['binary','varbinary'], true);
-  $isNumeric = !$isBinary && in_array($dt, ['int','bigint','smallint','mediumint','tinyint','decimal','double','float'], true);
-  return [
-    'numeric' => $isNumeric,
-    'bind'    => $isBinary ? 's' : ($isNumeric ? 'i' : 's'),
-    'binary'  => $isBinary
-  ];
+// smart defaults (EXACT tokens)
+$DEFAULT_PENDING  = pick_status_exact($STATUS_ENUM_MAP, ['pending','inactive','disabled','new','unverified'], 'pending');
+$VALUE_ACTIVE     = pick_status_exact($STATUS_ENUM_MAP, ['active','enabled','approved'], 'active');
+$VALUE_DISABLED   = pick_status_exact($STATUS_ENUM_MAP, ['disabled','inactive','rejected','blocked','banned'], 'disabled');
+
+// if status exists but we could not pick any (rare), skip writing status to avoid invalid enum
+if ($status_col && !$DEFAULT_PENDING && !$VALUE_ACTIVE && !$VALUE_DISABLED) {
+  $status_col = null;
 }
-$PKI       = pk_info($conn,$U_TBL,$U_PK);
-$PK_IS_NUM = $PKI['numeric'];
-$PK_BIND   = $PKI['bind'];      // 'i' or 's'
-$PK_IS_BIN = $PKI['binary'];    // true if BINARY/VARBINARY
-$WHERE_PK  = $PK_IS_BIN ? "`$U_PK`=UNHEX(?)" : "`$U_PK`=?"; // use in WHERE
-$PK_SELECT = $PK_IS_BIN ? "HEX(`$U_PK`) AS id" : "`$U_PK` AS id"; // use in SELECT/HTML
 
-// Helper to read PK from POST safely (accepts HEX when binary)
-$get_pk = function(string $field='id') use ($PK_IS_NUM, $PK_IS_BIN) {
-  $raw = $_POST[$field] ?? '';
-  if ($PK_IS_NUM) {
-    $v = (int)$raw;
-    return ($v>0) ? $v : null;
-  }
-  $v = trim((string)$raw);
-  if ($PK_IS_BIN) {
-    if ($v === '' || !preg_match('/^[0-9a-fA-F]+$/', $v)) return null; // expect HEX
-  } else {
-    if ($v === '') return null;
-  }
-  return $v;
-};
+$HAS_CO = tableExists($conn,'customer_orders') && colExists($conn,'customer_orders','customer_id');
 
 // ---------- Actions (POST) ----------
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   if (!csrf_valid($_POST['csrf'] ?? '')) { http_response_code(400); die('CSRF validation failed'); }
   $action = $_POST['action'] ?? '';
 
+  // Helper: fetch and validate incoming PK value respecting PK type
+  $get_pk = function(string $field='id') use ($PK_IS_NUM) {
+    $raw = $_POST[$field] ?? '';
+    if ($PK_IS_NUM) {
+      $v = (int)$raw;
+      return ($v>0) ? $v : null;
+    } else {
+      $v = trim((string)$raw);
+      return ($v!=='') ? $v : null;
+    }
+  };
+
   if ($action==='create') {
-    if (!$has_username || !$pwd_col) { flash_set('error','Create not available: users.username or password column missing.'); header('Location: users.php'); exit; }
+    if (!$has_username || !$pwd_col) { flash_set('error','Create not available: username/user_name or password column missing.'); header('Location: users.php'); exit; }
 
     $username = trim($_POST['username'] ?? '');
     $email    = trim($_POST['email'] ?? '');
@@ -190,9 +246,9 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
     // Uniqueness checks
     if ($has_email) {
-      $stmt=$conn->prepare("SELECT SUM(username = ?) AS u_taken, SUM(`$email_col` = ?) AS e_taken
+      $stmt=$conn->prepare("SELECT SUM(`$uname_col` = ?) AS u_taken, SUM(`$email_col` = ?) AS e_taken
                             FROM `$U_TBL`
-                            WHERE username=? OR `$email_col`=?");
+                            WHERE `$uname_col`=? OR `$email_col`=?");
       $stmt->bind_param('ssss',$username,$email,$username,$email);
       $stmt->execute();
       $dup = $stmt->get_result()->fetch_assoc() ?: ['u_taken'=>0,'e_taken'=>0];
@@ -200,7 +256,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       if ((int)$dup['u_taken']>0) { flash_set('error','Username already exists.'); header('Location: users.php'); exit; }
       if ((int)$dup['e_taken']>0) { flash_set('error','Email already exists.'); header('Location: users.php'); exit; }
     } else {
-      $stmt=$conn->prepare("SELECT 1 FROM `$U_TBL` WHERE username=? LIMIT 1");
+      $stmt=$conn->prepare("SELECT 1 FROM `$U_TBL` WHERE `$uname_col`=? LIMIT 1");
       $stmt->bind_param('s',$username);
       $stmt->execute(); $stmt->store_result();
       if ($stmt->num_rows>0){ $stmt->close(); flash_set('error','Username already exists.'); header('Location: users.php'); exit; }
@@ -210,38 +266,40 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $hash = password_hash($password, PASSWORD_BCRYPT);
 
     // Build INSERT dynamically
-    $fields=['username',$pwd_col]; $place=['?','?']; $types='ss'; $vals=[$username,$hash];
-    if ($has_email){ $fields[]=$email_col; $place[]='?'; $types.='s'; $vals[]=$email; }
+    $fields=["`$uname_col`","`$pwd_col`"]; $place=['?','?']; $types='ss'; $vals=[$username,$hash];
+    if ($has_email){ $fields[]="`$email_col`"; $place[]='?'; $types.='s'; $vals[]=$email; }
 
     // Names (still saved even if not displayed)
-    if     ($has_full)                  { $fields[]='full_name';  $place[]='?'; $types.='s'; $vals[]=$full; }
-    elseif ($has_name)                  { $fields[]='name';       $place[]='?'; $types.='s'; $vals[]=$full; }
+    if     ($has_full)                  { $fields[]='`full_name`';  $place[]='?'; $types.='s'; $vals[]=$full; }
+    elseif ($has_name)                  { $fields[]='`name`';       $place[]='?'; $types.='s'; $vals[]=$full; }
     elseif ($has_fn || $has_ln)         { [$fn,$ln]=split_name($full);
-                                          if ($has_fn){ $fields[]='first_name'; $place[]='?'; $types.='s'; $vals[]=$fn; }
-                                          if ($has_ln){ $fields[]='last_name';  $place[]='?'; $types.='s'; $vals[]=$ln; } }
-    if ($has_role_col) { $fields[]='role'; $place[]='?'; $types.='s'; $vals[]=$role; }
+                                          if ($has_fn){ $fields[]='`first_name`'; $place[]='?'; $types.='s'; $vals[]=$fn; }
+                                          if ($has_ln){ $fields[]='`last_name`';  $place[]='?'; $types.='s'; $vals[]=$ln; } }
+    if ($has_role_col) { $fields[]='`role`'; $place[]='?'; $types.='s'; $vals[]=$role; }
 
-    // Defaults for status/gates
-    if ($status_col)      { $fields[]=$status_col;      $place[]='?'; $types.='s'; $vals[]='pending'; }
-    if ($gate_active_col) { $fields[]=$gate_active_col; $place[]='?'; $types.='i'; $vals[]=0; }
-    if ($gate_approve_col){ $fields[]=$gate_approve_col;$place[]='?'; $types.='i'; $vals[]=0; }
+    // Defaults for status/gates (use EXACT enum token)
+    if ($status_col && $DEFAULT_PENDING){ $fields[]="`$status_col`"; $place[]='?'; $types.='s'; $vals[]=$DEFAULT_PENDING; }
+    if ($gate_active_col) { $fields[]="`$gate_active_col`"; $place[]='?'; $types.='i'; $vals[]=0; }
+    if ($gate_approve_col){ $fields[]="`$gate_approve_col`";$place[]='?'; $types.='i'; $vals[]=0; }
 
-    if ($has_created_at) { $fields[]='created_at'; $place[]='NOW()'; }
+    if ($created_col) { $fields[]="`$created_col`"; $place[]='NOW()'; }
 
     $sql = "INSERT INTO `$U_TBL` (".implode(',',$fields).") VALUES (".implode(',',$place).")";
     $st  = $conn->prepare($sql);
     if (substr_count($sql,'?')>0) $st->bind_param($types, ...$vals);
-    $ok = $st->execute(); $st->close();
-    flash_set($ok?'success':'error', $ok?'User created.':'Create failed: '.$conn->error);
+    $ok = $st->execute(); $err = $conn->error; $st->close();
+    flash_set($ok?'success':'error', $ok?'User created.':('Create failed: '.$err));
     header('Location: users.php'); exit;
   }
 
   if ($action==='reset_password') {
     if (!$pwd_col){ flash_set('error','Reset not available: no password column.'); header('Location: users.php'); exit; }
-    $id = $get_pk(); if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
+    $id = $get_pk('id');
+    if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
     $hash = password_hash('password', PASSWORD_BCRYPT);
-    $sql  = "UPDATE `$U_TBL` SET `$pwd_col`=?, ".($has_updated_at?'`updated_at`=NOW(), ':'')."`$U_PK`=`$U_PK` WHERE $WHERE_PK";
-    $st   = $conn->prepare($sql); $st->bind_param('s'.$PK_BIND, $hash, $id);
+    $sql  = "UPDATE `$U_TBL` SET `$pwd_col`=?, ".($has_updated_at?'`updated_at`=NOW(), ':'')."`$U_PK`=`$U_PK` WHERE `$U_PK`=?";
+    $st   = $conn->prepare($sql);
+    $st->bind_param('s'.$PK_BIND, $hash, $id);
     $ok   = $st->execute(); $st->close();
     flash_set($ok?'success':'error',$ok?"Password reset to <code>password</code>.":'Reset failed.');
     header('Location: users.php'); exit;
@@ -249,54 +307,68 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
 
   if ($action==='approve' || $action==='disable') {
     if (!$supportToggle){ flash_set('error','Status toggle not supported by current users schema.'); header('Location: users.php'); exit; }
-    $id = $get_pk(); if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
+    $id = $get_pk('id');
+    if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
 
-    // Prevent disabling last admin / self (if role column exists)
+    // Prevent disabling last admin / self (if role column exists) — only when PK is numeric doesn't matter, bind safely
     if ($has_role_col && $action==='disable') {
-      $q=$conn->prepare("SELECT `role` FROM `$U_TBL` WHERE $WHERE_PK");
+      $q=$conn->prepare("SELECT `role` FROM `$U_TBL` WHERE `$U_PK`=?");
       $q->bind_param($PK_BIND,$id); $q->execute();
       $role=strtolower($q->get_result()->fetch_assoc()['role'] ?? ''); $q->close();
       if ($role==='admin') {
         $adminCount=(int)scalar($conn,"SELECT COUNT(*) FROM `$U_TBL` WHERE `role`='admin'");
-        $actingId=(int)($_SESSION['user_id'] ?? 0);
-        // if PK is binary, skip self-check comparison (different repr) — safer than false-positive
-        if (!$PK_IS_BIN && $id===$actingId){ flash_set('error','You cannot disable your own admin account.'); header('Location: users.php'); exit; }
+        $actingId = $_SESSION['user_id'] ?? null;
+        if ($actingId!==null) {
+          // compare as strings to be safe
+          if ((string)$id === (string)$actingId){ flash_set('error','You cannot disable your own admin account.'); header('Location: users.php'); exit; }
+        }
         if ($adminCount<=1){ flash_set('error','Cannot disable the last remaining admin.'); header('Location: users.php'); exit; }
       }
     }
 
     $toActive = ($action==='approve');
     $parts=[]; $types=''; $vals=[];
-    if ($status_col)      { $parts[]="`$status_col`=?";      $types.='s'; $vals[]=$toActive?'active':'inactive'; }
+    if ($status_col) {
+      $target = $toActive ? ($VALUE_ACTIVE ?: 'active') : ($VALUE_DISABLED ?: 'disabled');
+      $parts[]="`$status_col`=?"; $types.='s'; $vals[]=$target;
+    }
     if ($gate_active_col) { $parts[]="`$gate_active_col`=?"; $types.='i'; $vals[]=$toActive?1:0; }
-    if ($gate_approve_col){ $parts[]="`$gate_approve_col`=?";$types.='i'; $vals[]=$toActive?1:0; }
+    if ($gate_approve_col){ $parts[]="`$gate_approve_col`=?"; $types.='i'; $vals[]=$toActive?1:0; }
     if ($has_updated_at)  { $parts[]="`updated_at`=NOW()"; }
-    $sql="UPDATE `$U_TBL` SET ".implode(',',$parts)." WHERE $WHERE_PK";
-    $types.=$PK_BIND; $vals[]=$id; $st=$conn->prepare($sql); $st->bind_param($types, ...$vals);
-    $ok=$st->execute(); $st->close();
-    flash_set($ok?'success':'error', $ok?ucfirst($action).'d.':ucfirst($action).' failed.');
+    $sql="UPDATE `$U_TBL` SET ".implode(',',$parts)." WHERE `$U_PK`=?";
+    $types.=$PK_BIND; $vals[]=$id;
+    $st=$conn->prepare($sql); $st->bind_param($types, ...$vals);
+    $ok=$st->execute(); $err=$conn->error; $st->close();
+    flash_set($ok?'success':'error', $ok?ucfirst($action).'d.':(ucfirst($action).' failed. '.$err));
     header('Location: users.php'); exit;
   }
 
   if ($action==='delete') {
-    $id = $get_pk(); if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
-    $actingId = (int)($_SESSION['user_id'] ?? 0);
-    if (!$PK_IS_BIN && $id === $actingId){ flash_set('error','You cannot delete your own account.'); header('Location: users.php'); exit; }
+    $id = $get_pk('id');
+    if ($id===null){ flash_set('error','Invalid user.'); header('Location: users.php'); exit; }
+
+    // Prevent self-delete if we can compare (string-safe)
+    $actingId = $_SESSION['user_id'] ?? null;
+    if ($actingId!==null && (string)$id === (string)$actingId){ flash_set('error','You cannot delete your own account.'); header('Location: users.php'); exit; }
+
     if ($has_role_col) {
-      $q=$conn->prepare("SELECT `role` FROM `$U_TBL` WHERE $WHERE_PK"); $q->bind_param($PK_BIND,$id); $q->execute();
+      $q=$conn->prepare("SELECT `role` FROM `$U_TBL` WHERE `$U_PK`=?");
+      $q->bind_param($PK_BIND,$id); $q->execute();
       $role=strtolower($q->get_result()->fetch_assoc()['role'] ?? ''); $q->close();
       if ($role==='admin') {
         $adminCount=(int)scalar($conn,"SELECT COUNT(*) FROM `$U_TBL` WHERE `role`='admin'");
         if ($adminCount<=1){ flash_set('error','Cannot delete the last remaining admin.'); header('Location: users.php'); exit; }
       }
     }
+
     if ($HAS_CO) {
-      $st=$conn->prepare("SELECT COUNT(*) c FROM `customer_orders` WHERE `customer_id`".($PK_IS_BIN?"=UNHEX(?)":"=?"));
+      $st=$conn->prepare("SELECT COUNT(*) c FROM `customer_orders` WHERE `customer_id`=?");
       $st->bind_param($PK_BIND,$id); $st->execute();
       $c=(int)($st->get_result()->fetch_assoc()['c'] ?? 0); $st->close();
       if ($c>0){ flash_set('error','Cannot delete: user has linked orders. Disable instead.'); header('Location: users.php'); exit; }
     }
-    $st = $conn->prepare("DELETE FROM `$U_TBL` WHERE $WHERE_PK LIMIT 1"); $st->bind_param($PK_BIND,$id);
+
+    $st = $conn->prepare("DELETE FROM `$U_TBL` WHERE `$U_PK`=? LIMIT 1"); $st->bind_param($PK_BIND,$id);
     $ok = $st->execute(); $aff=$st->affected_rows; $st->close();
     flash_set(($ok && $aff>0)?'success':'error', ($ok && $aff>0)?'User deleted.' : 'Delete failed.');
     header('Location: users.php'); exit;
@@ -314,14 +386,14 @@ $where=[]; $bind=''; $args=[];
 
 if ($search!==''){
   if ($has_email) {
-    $where[]="(username LIKE CONCAT('%',?,'%') OR `$email_col` LIKE CONCAT('%',?,'%') OR ($fullname_expr) LIKE CONCAT('%',?,'%'))";
+    $where[]="(`$uname_col` LIKE CONCAT('%',?,'%') OR `$email_col` LIKE CONCAT('%',?,'%') OR ($fullname_expr) LIKE CONCAT('%',?,'%'))";
     $bind.='sss'; $args[]=$search; $args[]=$search; $args[]=$search;
   } else {
-    $where[]="(username LIKE CONCAT('%',?,'%') OR ($fullname_expr) LIKE CONCAT('%',?,'%'))";
+    $where[]="(`$uname_col` LIKE CONCAT('%',?,'%') OR ($fullname_expr) LIKE CONCAT('%',?,'%'))";
     $bind.='ss'; $args[]=$search; $args[]=$search;
   }
 }
-if ($has_role_col && $f_role!==''){ $where[]='role=?'; $bind.='s'; $args[]=$f_role; }
+if ($has_role_col && $f_role!==''){ $where[]='`role`=?'; $bind.='s'; $args[]=$f_role; }
 $W = $where ? ('WHERE '.implode(' AND ',$where)) : '';
 
 // Count
@@ -334,7 +406,7 @@ $pages = max(1,(int)ceil($total/$per));
 if ($page>$pages) $page=$pages;
 $off = ($page-1)*$per;
 
-// Build SELECT (use HEX(id) as id when PK is binary; DO NOT select full_name for display)
+// Build SELECT (NO Name column shown)
 $email_select = $has_email ? "`$email_col` AS email" : "'' AS email";
 $extra = [];
 if ($status_col)        $extra[] = "`$status_col` AS u_status";
@@ -342,7 +414,7 @@ if ($gate_active_col)   $extra[] = "`$gate_active_col` AS u_active";
 if ($gate_approve_col)  $extra[] = "`$gate_approve_col` AS u_approved";
 $orders_select = $HAS_CO ? ", (SELECT COUNT(*) FROM `customer_orders` co WHERE co.`customer_id` = `$U_TBL`.`$U_PK`) AS orders_ct" : '';
 
-$sql = "SELECT $PK_SELECT, `username`, $email_select"
+$sql = "SELECT `$U_PK` AS id, `$uname_col` AS username, $email_select"
      . ($has_role_col ? ", `role`" : ", 'customer' AS role")
      . ($created_col ? ", `$created_col`" : ", NULL AS created_at")
      . (count($extra)? ', '.implode(', ',$extra) : '')
@@ -353,7 +425,7 @@ $st = $conn->prepare($sql);
 if ($bind!=='') $st->bind_param($bind, ...$args);
 $st->execute(); $rows=$st->get_result()->fetch_all(MYSQLI_ASSOC); $st->close();
 
-// ---------- Flash (suppress auth-related leftovers) ----------
+// ---------- Flash ----------
 $flash = flash_get();
 if ($flash) {
   $msg = trim((string)($flash['msg'] ?? $flash['m'] ?? ''));
@@ -374,16 +446,10 @@ include __DIR__ . '/inc/layout_head.php';
   .pm-compact .table{ margin-bottom:0; }
   .pm-compact .table > :not(caption) > * > *{ padding:.35rem .45rem; }
   .pm-compact .badge{ padding:.16rem .42rem;font-size:.72rem;font-weight:600; }
-
-  /* Ensure modals/backdrop sit above any sticky headers/sidebars */
   :root{ --pm-z-backdrop: 2040; --pm-z-modal: 2050; }
   .modal-backdrop{ z-index: var(--pm-z-backdrop) !important; }
   .modal{ z-index: var(--pm-z-modal) !important; }
-
-  /* Prevent background scroll when modal is open */
   body.modal-open{ overflow: hidden; }
-
-  /* Small-screen polish */
   @media (max-width: 576px){
     .pm-compact { font-size: 13px; }
     .pm-compact .card-body{ padding:.5rem; }
@@ -395,7 +461,7 @@ include __DIR__ . '/inc/layout_head.php';
   <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
     <h6 class="fw-bold mb-0">Users</h6>
     <button class="btn btn-sm btn-dark" data-bs-toggle="modal" data-bs-target="#createModal"
-      <?= (!$has_username || !$pwd_col) ? 'disabled title="Create requires username & password columns"' : '' ?>>
+      <?= (!$has_username || !$pwd_col) ? 'disabled title="Create requires username/user_name & a password column"' : '' ?>>
       <i class="fa fa-plus me-1"></i> New User
     </button>
   </div>
@@ -428,7 +494,7 @@ include __DIR__ . '/inc/layout_head.php';
     </div>
   </form>
 
-  <!-- Table (NO Name column) -->
+  <!-- Table -->
   <div class="card">
     <div class="card-body table-responsive">
       <table class="table align-middle">
@@ -446,14 +512,15 @@ include __DIR__ . '/inc/layout_head.php';
           // Determine display status
           $dispStatus = '—';
           if (isset($u['u_status']) && $u['u_status']!=='') {
-            $val = strtolower((string)$u['u_status']);
-            $dispStatus = in_array($val,['active','inactive','pending'],true) ? $val : $val;
+            $dispStatus = (string)$u['u_status'];
           } elseif (isset($u['u_active']) || isset($u['u_approved'])) {
             $isActive = isset($u['u_active']) ? ((int)$u['u_active']===1) : null;
             $isAppr   = isset($u['u_approved']) ? ((int)$u['u_approved']===1) : null;
             $dispStatus = ($isActive===1 || $isAppr===1) ? 'active' : 'pending';
           }
-          $color = $dispStatus==='active' ? 'success' : ($dispStatus==='inactive' ? 'secondary' : 'warning');
+          $lc = strtolower($dispStatus);
+          $color = ($lc==='active') ? 'success'
+                 : (in_array($lc,['inactive','disabled','rejected','blocked','banned']) ? 'secondary' : 'warning');
           $hasOrders = $HAS_CO ? ((int)($u['orders_ct'] ?? 0) > 0) : false;
         ?>
           <tr>
@@ -463,19 +530,19 @@ include __DIR__ . '/inc/layout_head.php';
             <td><span class="badge text-bg-<?=$color?>"><?=h(ucfirst($dispStatus))?></span></td>
             <td class="text-end">
               <?php if ($supportToggle): ?>
-                <?php if ($dispStatus!=='active'): ?>
+                <?php if (strtolower($dispStatus)!=='active'): ?>
                 <form method="post" class="d-inline js-confirm" data-message="Approve this user?">
                   <input type="hidden" name="csrf" value="<?=h($_SESSION['csrf'])?>">
                   <input type="hidden" name="action" value="approve">
-                  <input type="hidden" name="id" value="<?= h($u['id']) ?>"><!-- HEX when binary -->
+                  <input type="hidden" name="id" value="<?= h($u['id']) ?>">
                   <button class="btn btn-sm btn-outline-success" title="Approve"><i class="fa fa-check"></i></button>
                 </form>
                 <?php endif; ?>
-                <?php if ($dispStatus==='active' || $dispStatus==='pending'): ?>
+                <?php if (in_array(strtolower($dispStatus),['active','pending','inactive'])): ?>
                 <form method="post" class="d-inline js-confirm ms-1" data-message="Disable this user?">
                   <input type="hidden" name="csrf" value="<?=h($_SESSION['csrf'])?>">
                   <input type="hidden" name="action" value="disable">
-                  <input type="hidden" name="id" value="<?= h($u['id']) ?>"><!-- HEX when binary -->
+                  <input type="hidden" name="id" value="<?= h($u['id']) ?>">
                   <button class="btn btn-sm btn-outline-warning" title="Disable"><i class="fa fa-ban"></i></button>
                 </form>
                 <?php endif; ?>
@@ -486,14 +553,14 @@ include __DIR__ . '/inc/layout_head.php';
                     <?= $pwd_col ? '' : 'onsubmit="return false" title="No password column"' ?>>
                 <input type="hidden" name="csrf" value="<?=h($_SESSION['csrf'])?>">
                 <input type="hidden" name="action" value="reset_password">
-                <input type="hidden" name="id" value="<?= h($u['id']) ?>"><!-- HEX when binary -->
+                <input type="hidden" name="id" value="<?= h($u['id']) ?>">
                 <button class="btn btn-sm btn-outline-dark" <?= $pwd_col?'':'disabled' ?> title="Reset Password"><i class="fa fa-key"></i></button>
               </form>
 
               <!-- Delete -->
               <button class="btn btn-sm btn-outline-danger ms-1"
                       data-bs-toggle="modal" data-bs-target="#deleteModal"
-                      data-id="<?= h($u['id']) ?>"  <!-- HEX when binary -->
+                      data-id="<?= h($u['id']) ?>"
                       data-username="<?= h($u['username']) ?>"
                       data-role="<?= h($u['role']) ?>"
                       <?= $hasOrders ? 'disabled title="Has orders; cannot delete"' : '' ?>>
@@ -586,7 +653,6 @@ include __DIR__ . '/inc/layout_head.php';
 <script>
 // Simple confirm hooks + fill delete modal + ensure only one modal visible
 document.addEventListener('DOMContentLoaded', function(){
-  // one-at-a-time modal (prevents overlap)
   document.addEventListener('show.bs.modal', (ev) => {
     document.querySelectorAll('.modal.show').forEach(m => {
       if (m !== ev.target) {
@@ -595,7 +661,6 @@ document.addEventListener('DOMContentLoaded', function(){
       }
     });
   });
-
   for (const f of document.querySelectorAll('form.js-confirm')) {
     if (f.dataset.bound==='1') continue; f.dataset.bound='1';
     f.addEventListener('submit', function(e){
@@ -603,7 +668,6 @@ document.addEventListener('DOMContentLoaded', function(){
       if (!confirm(msg)) { e.preventDefault(); return false; }
     });
   }
-
   const del = document.getElementById('deleteModal');
   del?.addEventListener('show.bs.modal', (ev)=>{
     const b = ev.relatedTarget || document.activeElement; if (!b) return;
@@ -614,4 +678,4 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 </script>
 
-<?php include __DIR__ . '/inc/layout_foot.php';
+<?php include __DIR__ . '/inc/layout_foot.php'; ?>
